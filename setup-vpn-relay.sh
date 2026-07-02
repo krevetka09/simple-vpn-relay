@@ -67,8 +67,17 @@ create_backup() {
     
     # Проверяем целостность бэкапа
     if [[ ! -f "$BACKUP_DIR/configs_$ts.tar.gz" ]]; then
-        warn "Не удалось создать бэкап конфигов"
+        error "Не удалось создать бэкап конфигов"
+        error "Проверьте свободное место: df -h"
+        error "Проверьте права: ls -la $BACKUP_DIR"
+        die "Бэкап не создан, установка прервана"
     fi
+
+# Проверяем размер бэкапа (должен быть больше 0 байт)
+if [[ ! -s "$BACKUP_DIR/configs_$ts.tar.gz" ]]; then
+    error "Бэкап пустой или повреждён"
+    die "Бэкап невалиден, установка прервана"
+fi
     
     # Создаем исполняемый скрипт отката
     cat > "$BACKUP_DIR/rollback_$ts.sh" << ROLLBACK_EOF
@@ -280,6 +289,9 @@ echo "=== XRAY RELAY MANAGER v$VERSION ===" > "$LOG"
 echo "Начало: $(date)" >> "$LOG"
 echo "Хост: $(hostname)" >> "$LOG"
 
+# КРИТИЧЕСКИ ВАЖНО: Создаём бэкап ПЕРЕД любыми изменениями
+create_backup
+
 # ============================================================================
 # ШАГ 1: ПРОВЕРКА DNS
 # ============================================================================
@@ -429,8 +441,8 @@ fi
 
 section "Шаг 6: Настройка relay"
 
-if relay_ssh 'systemctl is-active amneziawg@awg0 >/dev/null 2>&1'; then
-    log "✓ Relay уже настроен"
+if relay_ssh 'systemctl is-active amneziawg@awg0 >/dev/null 2>&1 && test -f /root/relay-configs/client.conf'; then
+    log "✓ Relay уже настроен и конфиг существует"
 else
     log "Настройка relay..."
     
@@ -875,6 +887,11 @@ else
             -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
             -subj "/CN=www.apple.com" -days 3650 2>/dev/null
         
+        # ИСПРАВЛЕНИЕ: Правильные права доступа для сертификатов
+        chmod 644 /etc/hysteria/cert.pem
+        chmod 600 /etc/hysteria/key.pem
+        chown -R root:root /etc/hysteria
+        
         cat > /etc/hysteria/config.yaml << EOF
 listen: :8443
 
@@ -995,10 +1012,10 @@ else
     warn "Xray не запустился"
 fi
 
-if ss -tlnp | grep -q ":443 "; then
-    log "✓ Порт 443 слушается"
+if ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
+    log "✓ Порт 443 слушается внутри namespace"
 else
-    warn "Порт 443 не слушается"
+    warn "Порт 443 не слушается внутри namespace"
 fi
 
 # SMOKE ТЕСТЫ
@@ -1015,9 +1032,9 @@ else
     SMOKE_PASSED=false
 fi
 
-echo "Тест 2: Проверка порта 443..."
-if ss -tlnp | grep -q ":443.*xray"; then
-    log "✓ Тест 2 пройден: Порт 443 слушается Xray"
+echo "Тест 2: Проверка порта 443 внутри namespace..."
+if ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
+    log "✓ Тест 2 пройден: Порт 443 слушается Xray внутри namespace"
 else
     error "✗ Тест 2 НЕ пройден"
     SMOKE_PASSED=false
@@ -1056,6 +1073,7 @@ HYSTERIA_DIR="/etc/hysteria"
 ALERTS_DIR="$CONFIG_DIR/alerts"
 NAMESPACE="xray"
 LOG_FILE="/var/log/xray-admin.log"
+BACKUP_DIR="/root/.xray-backups"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -1245,6 +1263,9 @@ cmd_help() {
     echo "  restart             - Перезапустить все сервисы"
     echo "  monitor             - Запустить мониторинг"
     echo "  alerts              - Настроить оповещения"
+    echo "  restore             - Восстановить из последнего бэкапа"
+    echo "  update              - Обновить Xray до последней версии"
+    echo "  version             - Показать версию и установленные компоненты"
     echo "  help                - Показать эту справку"
     echo ""
     echo "Примеры:"
@@ -1253,6 +1274,62 @@ cmd_help() {
     echo "  xray-admin status"
 }
 
+cmd_restore() {
+    log_action "restore"
+    if [[ ! -f "$BACKUP_DIR/latest_backup" ]]; then
+        error "Бэкапы не найдены в $BACKUP_DIR"
+        exit 1
+    fi
+    
+    local latest_ts=$(cat "$BACKUP_DIR/latest_backup")
+    local rollback_script="$BACKUP_DIR/rollback_$latest_ts.sh"
+    
+    if [[ ! -f "$rollback_script" ]]; then
+        error "Скрипт отката не найден: $rollback_script"
+        exit 1
+    fi
+    
+    echo -e "${YELLOW}Восстановление из бэкапа #$latest_ts...${NC}"
+    bash "$rollback_script"
+    echo -e "${GREEN}✓ Восстановление завершено${NC}"
+}
+
+cmd_update() {
+    log_action "update"
+    echo "Проверка обновлений Xray..."
+    
+    local current_version=$(xray version 2>&1 | head -1 | grep -oP 'Xray \K[0-9.]+')
+    local latest=$(curl -sL https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null | grep -oP 'tag/v\K[0-9.]+' | head -1)
+    
+    if [[ "$current_version" == "$latest" ]]; then
+        echo -e "${GREEN}✓ Xray уже обновлён до версии $current_version${NC}"
+        return 0
+    fi
+    
+    echo "Доступна новая версия: $latest (текущая: $current_version)"
+    read -p "Обновить? (y/N): " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
+    
+    systemctl stop xray
+    cd /tmp
+    wget -q -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${latest}/Xray-linux-64.zip"
+    unzip -o -q /tmp/xray.zip -d /usr/local/xray
+    rm -f /tmp/xray.zip
+    chmod +x /usr/local/xray/xray
+    systemctl start xray
+    
+    echo -e "${GREEN}✓ Xray обновлён до версии $latest${NC}"
+}
+
+cmd_version() {
+    echo "xray-admin v5.0.0"
+    echo "VPN Relay Manager"
+    echo ""
+    echo "Установленные компоненты:"
+    echo "  Xray: $(xray version 2>&1 | head -1 || echo 'не установлен')"
+    echo "  Hysteria2: $(hysteria version 2>&1 | head -1 || echo 'не установлен')"
+    echo "  AmneziaWG: $(awg --version 2>&1 | head -1 || echo 'не установлен')"
+}
 case "${1:-help}" in
     status)     cmd_status ;;
     add)        cmd_add_client "${2:-}" ;;
@@ -1262,6 +1339,9 @@ case "${1:-help}" in
     restart)    cmd_restart ;;
     monitor)    cmd_monitor ;;
     alerts)     cmd_setup_alerts ;;
+    restore)    cmd_restore ;;
+    update)     cmd_update ;;
+    version|--version|-v) cmd_version ;;
     help|--help|-h|"") cmd_help ;;
     *)          echo "Неизвестная команда: $1"; cmd_help; exit 1 ;;
 esac
