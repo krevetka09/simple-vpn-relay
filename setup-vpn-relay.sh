@@ -424,7 +424,7 @@ AWG_EOF
 fi
 
 # ============================================================================
-# ШАГ 6: НАСТРОЙКА RELAY С ПРОВЕРКОЙ IPTABLES
+# ШАГ 6: НАСТРОЙКА RELAY С ПРОВЕРКОЙ IPTABLES (ИСПРАВЛЕНО)
 # ============================================================================
 
 section "Шаг 6: Настройка relay"
@@ -521,9 +521,11 @@ if ! systemctl is-active amneziawg@awg0 > /dev/null 2>&1; then
     exit 1
 fi
 
-# Проверяем iptables
-if ! iptables -t nat -L POSTROUTING | grep -q "MASQUERADE.*$DEFAULT_IFACE"; then
+# ИСПРАВЛЕНО: Добавлены флаги -v -n для корректной проверки
+if ! iptables -t nat -L POSTROUTING -v -n | grep -q "MASQUERADE.*$DEFAULT_IFACE"; then
     echo "ERROR: Правила iptables не применены"
+    echo "Проверка:"
+    iptables -t nat -L POSTROUTING -v -n
     exit 1
 fi
 
@@ -1312,7 +1314,8 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Финальный скрипт v5.0.0 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Исправленный скрипт v5.0.0 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
+print(f"\n🔧 Исправление: добавлены флаги -v -n к iptables в проверке на шаге 6")
 PYEOF
