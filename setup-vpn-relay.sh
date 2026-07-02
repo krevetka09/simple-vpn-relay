@@ -907,6 +907,42 @@ fix_hysteria_permissions() {
     return 1
 }
 
+# Функция создания правильного systemd-сервиса для Hysteria2
+# Решает проблему "permission denied" - запускает от root, а не от пользователя hysteria
+setup_hysteria_service() {
+    log "Создание systemd-сервиса Hysteria2 (запуск от root)..."
+    
+    cat > /etc/systemd/system/hysteria-server.service << 'HYSTERIA_SVC'
+[Unit]
+Description=Hysteria Server Service (via AmneziaWG relay)
+After=network.target wg-namespace.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/etc/hysteria
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+# Отключаем защиту, которая мешает читать сертификаты
+ProtectSystem=off
+ProtectHome=off
+PrivateTmp=off
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target
+HYSTERIA_SVC
+    
+    systemctl daemon-reload
+    systemctl enable hysteria-server > /dev/null 2>&1
+    log "✓ Systemd-сервис Hysteria2 создан (запуск от root)"
+}
+
+
 # Основная логика установки
 if check_hysteria_works; then
     log "✓ Hysteria2 уже установлен и работает"
@@ -941,24 +977,27 @@ else
             chmod 600 /etc/hysteria/key.pem
             chown -R root:root /etc/hysteria
             
-            # Пересоздаём конфиг
+           # Пересоздаём конфиг
             cat > /etc/hysteria/config.yaml << EOF
-listen: :8443
-
-tls:
-  cert: /etc/hysteria/cert.pem
-  key: /etc/hysteria/key.pem
-
-auth:
-  type: password
-  password: $HY_PASS
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.apple.com
-    rewriteHost: true
-EOF
+            listen: :8443
+            
+            tls:
+              cert: /etc/hysteria/cert.pem
+              key: /etc/hysteria/key.pem
+            
+            auth:
+              type: password
+              password: $HY_PASS
+            
+            masquerade:
+              type: proxy
+              proxy:
+                url: https://www.apple.com
+                rewriteHost: true
+            EOF
+            
+            # КРИТИЧЕСКИ ВАЖНО: создаём правильный systemd-сервис
+            setup_hysteria_service
             
             systemctl restart hysteria-server 2>/dev/null || true
             sleep 2
@@ -1006,7 +1045,10 @@ masquerade:
     rewriteHost: true
 EOF
             
-            systemctl enable hysteria-server > /dev/null 2>&1
+            # КРИТИЧЕСКИ ВАЖНО: создаём правильный systemd-сервис
+            # (перезаписывает сервис от установщика, который запускает от пользователя hysteria)
+            setup_hysteria_service
+            
             systemctl restart hysteria-server
             sleep 2
             
@@ -1090,9 +1132,36 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
+# КРИТИЧЕСКИ ВАЖНО: перезаписываем сервис Hysteria2
+# Установщик get.hy2.sh создаёт сервис с User=hysteria, который не может читать key.pem
+# Наш сервис запускает от root, что решает проблему permission denied
+cat > /etc/systemd/system/hysteria-server.service << 'HYSTERIA_SVC'
+[Unit]
+Description=Hysteria Server Service (via AmneziaWG relay)
+After=network.target wg-namespace.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/etc/hysteria
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+ProtectSystem=off
+ProtectHome=off
+PrivateTmp=off
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target
+HYSTERIA_SVC
+
 systemctl daemon-reload
-systemctl enable wg-namespace.service xray.service > /dev/null 2>&1
-log "✓ Сервисы созданы"
+systemctl enable wg-namespace.service xray.service hysteria-server.service > /dev/null 2>&1
+log "✓ Сервисы созданы (включая исправленный Hysteria2)"
 
 # ============================================================================
 # ШАГ 15: ЗАПУСК И SMOKE ТЕСТЫ
@@ -1102,12 +1171,21 @@ section "Шаг 15: Запуск и тестирование"
 
 /usr/local/bin/setup-awg-namespace.sh
 systemctl start xray
+
+# Перезапускаем Hysteria2 с правильным сервисом
+systemctl restart hysteria-server 2>/dev/null || true
 sleep 3
 
 if systemctl is-active --quiet xray; then
     log "✓ Xray запущен"
 else
     warn "Xray не запустился"
+fi
+
+if systemctl is-active --quiet hysteria-server; then
+    log "✓ Hysteria2 запущен"
+else
+    warn "Hysteria2 не запустился"
 fi
 
 if ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
