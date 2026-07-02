@@ -1128,27 +1128,15 @@ if ! ip netns list 2>/dev/null | grep -q "\$NAMESPACE"; then
     exit 1
 fi
 
-# Останавливаем старые socat процессы
-pkill -f "socat.*TCP-LISTEN:443" 2>/dev/null || true
-pkill -f "socat.*UDP-LISTEN:8443" 2>/dev/null || true
-sleep 1
-
 # Создаём veth-пару (если ещё не создана)
 if ! ip link show veth-host 2>/dev/null | grep -q "veth-host"; then
     echo "Создание veth-пары..."
     ip link add veth-host type veth peer name veth-ns
-    
-    # Подключаем veth-ns к namespace xray
     ip link set veth-ns netns \$NAMESPACE
-    
-    # Настраиваем IP в основном namespace
     ip addr add \$VETH_HOST_IP/24 dev veth-host
     ip link set veth-host up
-    
-    # Настраиваем IP в namespace xray
     ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns
     ip netns exec \$NAMESPACE ip link set veth-ns up
-    
     echo "✓ veth-пара создана: \$VETH_HOST_IP <-> \$VETH_NS_IP"
 else
     echo "✓ veth-пара уже существует"
@@ -1160,38 +1148,40 @@ if ! ping -c 1 -W 2 \$VETH_NS_IP >/dev/null 2>&1; then
     exit 1
 fi
 echo "✓ Связь с namespace установлена"
-
-# Проброс порта 443 (TCP - VLESS-REALITY)
-nohup socat TCP-LISTEN:443,fork,reuseaddr \
-    TCP:\$VETH_NS_IP:443 \
-    >/var/log/socat-443.log 2>&1 &
-echo \$! > /var/run/socat-443.pid
-echo "✓ Порт 443 (TCP) проброшен в namespace через veth"
-
-# Проброс порта 8443 (UDP - Hysteria2)
-nohup socat UDP-LISTEN:8443,fork,reuseaddr \
-    UDP:\$VETH_NS_IP:8443 \
-    >/var/log/socat-8443.log 2>&1 &
-echo \$! > /var/run/socat-8443.pid
-echo "✓ Порт 8443 (UDP) проброшен в namespace через veth"
-
-echo "✓ Проброс портов настроен"
+echo "✓ veth-пара настроена, socat запускается через systemd"
 SOCAT_EOF
-
 chmod +x /usr/local/bin/setup-socat-forward.sh
 
 # ИСПРАВЛЕНИЕ: Type=oneshot вместо Type=forking
-cat > /etc/systemd/system/socat-forward.service << 'EOF'
+# Создаём два ОТДЕЛЬНЫХ сервиса для socat (Type=simple, foreground)
+cat > /etc/systemd/system/socat-443.service << 'EOF'
 [Unit]
-Description=Socat Port Forwarding to Xray Namespace
+Description=Socat Port 443 Forwarding to Xray Namespace
 After=network.target wg-namespace.service
 Requires=wg-namespace.service
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/setup-socat-forward.sh
-RemainAfterExit=yes
-Restart=on-failure
+Type=simple
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/socat TCP-LISTEN:443,fork,reuseaddr TCP:10.200.0.2:443
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/socat-8443.service << 'EOF'
+[Unit]
+Description=Socat Port 8443 Forwarding to Xray Namespace
+After=network.target wg-namespace.service
+Requires=wg-namespace.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/socat UDP-LISTEN:8443,fork,reuseaddr UDP:10.200.0.2:8443
+Restart=always
 RestartSec=5
 
 [Install]
@@ -1199,8 +1189,17 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable socat-forward.service > /dev/null 2>&1
-log "✓ Socat сервис создан с veth-парой"
+systemctl enable wg-namespace.service xray.service hysteria-server.service > /dev/null 2>&1
+
+# КРИТИЧЕСКИ ВАЖНО: перезапускаем Hysteria2, чтобы он запустился в namespace
+# (в Шаге 13 он запустился БЕЗ namespace, теперь нужно перезапустить)
+if systemctl is-active --quiet hysteria-server; then
+    log "Перезапуск Hysteria2 для запуска в namespace..."
+    systemctl restart hysteria-server
+    sleep 2
+fi
+
+log "✓ Сервисы созданы (Xray и Hysteria2 в namespace)"
 
 # ============================================================================
 # ШАГ 16: ЗАПУСК И ПРОВЕРКА
@@ -1216,8 +1215,9 @@ sleep 2
 systemctl start hysteria-server
 sleep 2
 
-systemctl start socat-forward
-sleep 2
+# 4. Запускаем socat (два отдельных сервиса)
+systemctl start socat-443.service socat-8443.service
+sleep 3
 
 if systemctl is-active --quiet xray; then
     log "✓ Xray запущен (в namespace)"
@@ -1231,10 +1231,11 @@ else
     warn "Hysteria2 не запустился"
 fi
 
-if systemctl is-active --quiet socat-forward; then
-    log "✓ Socat проброс портов запущен"
+if systemctl is-active --quiet socat-443.service && systemctl is-active --quiet socat-8443.service; then
+    log "✓ Socat проброс портов запущен (443 и 8443)"
 else
     warn "Socat не запустился"
+    systemctl status socat-443.service socat-8443.service --no-pager || true
 fi
 
 if ss -tlnp | grep -q ":443"; then
@@ -1481,7 +1482,7 @@ cmd_restart() {
     echo "Перезапуск всех сервисов..."
     /usr/local/bin/setup-awg-namespace.sh
     /usr/local/bin/setup-socat-forward.sh
-    systemctl restart xray.service hysteria-server.service socat-forward.service 2>/dev/null || true
+    systemctl restart xray.service hysteria-server.service socat-443.service socat-8443.service 2>/dev/null || true
     sleep 3
     cmd_status
 }
@@ -1493,20 +1494,24 @@ cmd_monitor() {
         local xray_st awg_st socat_st ip
         xray_st=$(systemctl is-active xray 2>/dev/null || echo "inactive")
         awg_st=$(systemctl is-active awg-quick@awg0 2>/dev/null || echo "inactive")
-        socat_st=$(systemctl is-active socat-forward 2>/dev/null || echo "inactive")
+        socat_443_st=$(systemctl is-active socat-443.service 2>/dev/null || echo "inactive")
+        socat_8443_st=$(systemctl is-active socat-8443.service 2>/dev/null || echo "inactive")
         ip=$(get_public_ip)
-        echo -e "[$(date '+%H:%M:%S')] Xray: $xray_st | AWG: $awg_st | Socat: $socat_st | IP: $ip"
+        echo -e "[$(date '+%H:%M:%S')] Xray: $xray_st | AWG: $awg_st | Socat-443: $socat_443_st | Socat-8443: $socat_8443_st | IP: $ip"
+
         
         if [[ "$xray_st" != "active" ]]; then
             echo -e "${RED}Xray упал! Перезапуск...${NC}"
             /usr/local/bin/setup-awg-namespace.sh && systemctl restart xray
             send_alert "🚨 Xray перезагружен на $(hostname)"
         fi
-        if [[ "$socat_st" != "active" ]]; then
+        if [[ "$socat_443_st" != "active" || "$socat_8443_st" != "active" ]]; then
             echo -e "${RED}Socat упал! Перезапуск...${NC}"
             /usr/local/bin/setup-socat-forward.sh
+            systemctl restart socat-443.service socat-8443.service
             send_alert "🚨 Socat перезагружен на $(hostname)"
         fi
+        
         sleep 60
     done
 }
@@ -1681,7 +1686,8 @@ printf "  %-30s %s\n" "AmneziaWG (relay):" "$(relay_ssh 'systemctl is-active amn
 printf "  %-30s %s\n" "AmneziaWG (client):" "$(systemctl is-active awg-quick@awg0 2>/dev/null || echo 'inactive')"
 printf "  %-30s %s\n" "Xray:" "$(systemctl is-active xray 2>/dev/null || echo 'inactive')"
 printf "  %-30s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server 2>/dev/null || echo 'inactive')"
-printf "  %-30s %s\n" "Socat:" "$(systemctl is-active socat-forward 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Socat-443:" "$(systemctl is-active socat-443.service 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Socat-8443:" "$(systemctl is-active socat-8443.service 2>/dev/null || echo 'inactive')"
 echo ""
 
 echo -e "${YELLOW}IP информация:${NC}"
