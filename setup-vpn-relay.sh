@@ -873,26 +873,76 @@ fi
 
 section "Шаг 13: Установка Hysteria2"
 
-if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-    log "✓ Hysteria2 уже установлен"
+# Функция проверки работоспособности Hysteria2
+check_hysteria_works() {
+    # Проверяем, что сервис активен И слушает порт
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && \
+       ss -tlnp 2>/dev/null | grep -q ":8443.*hysteria"; then
+        return 0
+    fi
+    return 1
+}
+
+# Функция исправления прав и перезапуска
+fix_hysteria_permissions() {
+    log "Исправление прав доступа Hysteria2..."
+    
+    if [[ -f /etc/hysteria/key.pem ]]; then
+        chmod 644 /etc/hysteria/cert.pem 2>/dev/null || true
+        chmod 600 /etc/hysteria/key.pem 2>/dev/null || true
+        chown -R root:root /etc/hysteria 2>/dev/null || true
+        log "✓ Права исправлены"
+        
+        systemctl restart hysteria-server 2>/dev/null || true
+        sleep 2
+        
+        if check_hysteria_works; then
+            log "✓ Hysteria2 работает после исправления прав"
+            return 0
+        else
+            warn "Hysteria2 всё ещё не работает после исправления прав"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+# Основная логика установки
+if check_hysteria_works; then
+    log "✓ Hysteria2 уже установлен и работает"
 else
-    log "Установка Hysteria2..."
-    if ! retry_cmd 3 10 "bash <(curl -fsSL https://get.hy2.sh/)"; then
-        warn "Не удалось установить Hysteria2"
-    else
-        HY_PASS=$(jq -r '.clients[0].uuid' "$CONFIG_DIR/clients.json")
-        mkdir -p /etc/hysteria
+    # Hysteria2 установлен, но не работает - пробуем исправить
+    if command -v hysteria &> /dev/null && [[ -f /etc/hysteria/config.yaml ]]; then
+        warn "Hysteria2 установлен, но не работает"
         
-        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-            -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
-            -subj "/CN=www.apple.com" -days 3650 2>/dev/null
-        
-        # ИСПРАВЛЕНИЕ: Правильные права доступа для сертификатов
-        chmod 644 /etc/hysteria/cert.pem
-        chmod 600 /etc/hysteria/key.pem
-        chown -R root:root /etc/hysteria
-        
-        cat > /etc/hysteria/config.yaml << EOF
+        # Попытка 1: исправить права
+        if fix_hysteria_permissions; then
+            log "✓ Проблема решена исправлением прав"
+        else
+            # Попытка 2: пересоздать конфиг и сертификаты
+            warn "Пересоздаём конфиг и сертификаты..."
+            
+            HY_PASS=$(jq -r '.clients[0].uuid' "$CONFIG_DIR/clients.json" 2>/dev/null || echo "")
+            if [[ -z "$HY_PASS" ]]; then
+                error "Не удалось получить UUID из clients.json"
+                die "Hysteria2 не настроен"
+            fi
+            
+            # Удаляем старые сертификаты
+            rm -f /etc/hysteria/key.pem /etc/hysteria/cert.pem
+            
+            # Генерируем новые
+            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+                -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
+                -subj "/CN=www.apple.com" -days 3650 2>/dev/null
+            
+            # Устанавливаем правильные права
+            chmod 644 /etc/hysteria/cert.pem
+            chmod 600 /etc/hysteria/key.pem
+            chown -R root:root /etc/hysteria
+            
+            # Пересоздаём конфиг
+            cat > /etc/hysteria/config.yaml << EOF
 listen: :8443
 
 tls:
@@ -909,15 +959,63 @@ masquerade:
     url: https://www.apple.com
     rewriteHost: true
 EOF
-        
-        systemctl enable hysteria-server > /dev/null 2>&1
-        systemctl restart hysteria-server
-        sleep 2
-        
-        if systemctl is-active --quiet hysteria-server; then
-            log "✓ Hysteria2 запущен"
+            
+            systemctl restart hysteria-server 2>/dev/null || true
+            sleep 2
+            
+            if check_hysteria_works; then
+                log "✓ Hysteria2 работает после пересоздания конфига"
+            else
+                warn "Hysteria2 не запустился после пересоздания конфига"
+                warn "Проверьте логи: journalctl -u hysteria-server -n 20 --no-pager"
+            fi
+        fi
+    else
+        # Hysteria2 не установлен - устанавливаем с нуля
+        log "Установка Hysteria2..."
+        if ! retry_cmd 3 10 "bash <(curl -fsSL https://get.hy2.sh/)"; then
+            warn "Не удалось установить Hysteria2"
         else
-            warn "Hysteria2 не запустился"
+            HY_PASS=$(jq -r '.clients[0].uuid' "$CONFIG_DIR/clients.json")
+            mkdir -p /etc/hysteria
+            
+            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+                -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
+                -subj "/CN=www.apple.com" -days 3650 2>/dev/null
+            
+            # КРИТИЧЕСКИ ВАЖНО: Правильные права доступа для сертификатов
+            chmod 644 /etc/hysteria/cert.pem
+            chmod 600 /etc/hysteria/key.pem
+            chown -R root:root /etc/hysteria
+            
+            cat > /etc/hysteria/config.yaml << EOF
+listen: :8443
+
+tls:
+  cert: /etc/hysteria/cert.pem
+  key: /etc/hysteria/key.pem
+
+auth:
+  type: password
+  password: $HY_PASS
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.apple.com
+    rewriteHost: true
+EOF
+            
+            systemctl enable hysteria-server > /dev/null 2>&1
+            systemctl restart hysteria-server
+            sleep 2
+            
+            if check_hysteria_works; then
+                log "✓ Hysteria2 установлен и запущен"
+            else
+                warn "Hysteria2 установлен, но не запустился"
+                warn "Проверьте логи: journalctl -u hysteria-server -n 20 --no-pager"
+            fi
         fi
     fi
 fi
