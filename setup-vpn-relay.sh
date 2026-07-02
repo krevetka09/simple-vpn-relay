@@ -588,7 +588,12 @@ if command -v awg &> /dev/null && lsmod | grep -q amneziawg; then
 else
     log "Установка AmneziaWG..."
     
-    HEADERS=$(apt-cache search "linux-headers-$(uname -r)" 2>/dev/null | wc -l || echo "0")
+    HEADERS=0
+    if dpkg -l "linux-headers-$(uname -r)" 2>/dev/null | grep -q "^ii"; then
+        HEADERS=1
+    elif apt-cache show "linux-headers-$(uname -r)" 2>/dev/null | grep -q "Package:"; then
+        HEADERS=1
+    fi
     
     if [[ "$HEADERS" -eq 0 ]]; then
         warn "Headers недоступны, обновляем ядро..."
