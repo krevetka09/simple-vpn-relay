@@ -398,7 +398,14 @@ else
     log "Установка AmneziaWG..."
     
     # Проверяем доступность headers (ПРАВИЛЬНАЯ проверка через dpkg)
-    RELAY_HEADERS=$(relay_ssh 'dpkg -l "linux-headers-$(uname -r)" 2>/dev/null | grep -c "^ii" || echo "0"' || echo "0")
+    # ИСПРАВЛЕНИЕ: очищаем вывод от переводов строк и пробелов
+    RELAY_HEADERS=$(relay_ssh 'dpkg -l "linux-headers-$(uname -r)" 2>/dev/null | grep -c "^ii" || echo "0"' 2>/dev/null || echo "0")
+    RELAY_HEADERS=$(echo "$RELAY_HEADERS" | tr -d '\n\r ' | head -c 1)
+    
+    # Дополнительная проверка: если пустая строка, устанавливаем 0
+    if [[ -z "$RELAY_HEADERS" ]]; then
+        RELAY_HEADERS=0
+    fi
     
     if [[ "$RELAY_HEADERS" -eq 0 ]]; then
         warn "Headers недоступны, обновляем ядро..."
