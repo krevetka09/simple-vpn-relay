@@ -3,14 +3,14 @@ import os
 
 script = r'''#!/usr/bin/env bash
 # ============================================================================
-# XRAY RELAY MANAGER - Production Ready v6.0.9 (Final)
+# XRAY RELAY MANAGER - Production Ready v6.1.0 (Final)
 # Архитектура: Вариант B (Namespace + veth + socat)
-# ИСПРАВЛЕНО v6.0.9: Решение проблемы RTNETLINK File exists
+# ИСПРАВЛЕНО v6.1.0: Полная очистка awg-quick перед удалением namespace
 # ============================================================================
 
 set -euo pipefail
 
-readonly VERSION="6.0.9"
+readonly VERSION="6.1.0"
 readonly LOG="/var/log/xray-admin.log"
 readonly BACKUP_DIR="/root/.xray-backups"
 readonly CONFIG_DIR="/usr/local/etc/xray"
@@ -81,7 +81,7 @@ collect_diagnostics() {
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "📜 ПОСЛЕДНИЕ ЛОГИ СЕРВИСОВ (30 строк)"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        for service in xray hysteria-server socat-443 socat-8443 wg-namespace; do
+        for service in xray hysteria-server socat-443 socat-8443 wg-namespace awg-quick@awg0; do
             echo ""
             echo "▶ Логи сервиса: $service"
             journalctl -u "$service" -n 30 --no-pager 2>&1 || echo "  (логи недоступны)"
@@ -134,8 +134,11 @@ collect_diagnostics() {
         echo "🛡️ СОСТОЯНИЕ AMNEZIAWG (awg0)"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
-        echo "▶ Интерфейс awg0:"
-        ip link show awg0 2>&1 || echo "  (awg0 не существует)"
+        echo "▶ Интерфейс awg0 в основном namespace:"
+        ip link show awg0 2>&1 || echo "  (awg0 не существует в основном namespace)"
+        echo ""
+        echo "▶ Интерфейс awg0 в namespace xray:"
+        ip netns exec xray ip link show awg0 2>&1 || echo "  (awg0 не в namespace xray)"
         echo ""
         echo "▶ AmneziaWG статус:"
         awg show 2>&1 || echo "  (awg не запущен)"
@@ -184,10 +187,10 @@ collect_diagnostics() {
         echo ""
         
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "⚡ ЗАПУЩЕННЫЕ ПРОЦЕССЫ (xray, hysteria, socat)"
+        echo "⚡ ЗАПУЩЕННЫЕ ПРОЦЕССЫ (xray, hysteria, socat, awg)"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
-        ps aux | grep -E "(xray|hysteria|socat)" | grep -v grep || echo "  (процессы не найдены)"
+        ps aux | grep -E "(xray|hysteria|socat|awg)" | grep -v grep || echo "  (процессы не найдены)"
         echo ""
         
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -292,13 +295,18 @@ create_backup() {
 set -e
 echo "Начало отката к состоянию #$ts..."
 
+echo "Остановка всех сервисов..."
+systemctl stop xray hysteria-server socat-443 socat-8443 awg-quick@awg0 2>/dev/null || true
+sleep 2
+
+echo "Удаление интерфейсов внутри namespace..."
+if ip netns list 2>/dev/null | grep -q "^xray"; then
+    ip netns exec xray ip link delete awg0 2>/dev/null || true
+    ip netns exec xray ip link delete veth-ns 2>/dev/null || true
+fi
+
 echo "Удаление veth-пары..."
 ip link delete veth-host 2>/dev/null || true
-ip link delete veth-ns 2>/dev/null || true
-
-echo "Остановка сервисов..."
-systemctl stop xray hysteria-server socat-443 socat-8443 2>/dev/null || true
-systemctl stop awg-quick@awg0 2>/dev/null || true
 
 echo "Удаление namespace..."
 ip netns delete $NAMESPACE 2>/dev/null || rm -f /run/netns/$NAMESPACE || true
@@ -337,8 +345,15 @@ rollback() {
     
     if [[ ! -f "$BACKUP_DIR/latest_backup" ]]; then
         warn "Бэкапы не найдены, откат невозможен"
+        # Принудительная очистка даже без бэкапа
+        systemctl stop xray hysteria-server socat-443 socat-8443 awg-quick@awg0 2>/dev/null || true
+        sleep 2
+        if ip netns list 2>/dev/null | grep -q "^xray"; then
+            ip netns exec xray ip link delete awg0 2>/dev/null || true
+            ip netns exec xray ip link delete veth-ns 2>/dev/null || true
+        fi
         ip link delete veth-host 2>/dev/null || true
-        ip link delete veth-ns 2>/dev/null || true
+        ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
         return 0
     fi
 
@@ -348,8 +363,14 @@ rollback() {
 
     if [[ ! -f "$rollback_script" ]]; then
         error "Скрипт отката не найден: $rollback_script"
+        systemctl stop xray hysteria-server socat-443 socat-8443 awg-quick@awg0 2>/dev/null || true
+        sleep 2
+        if ip netns list 2>/dev/null | grep -q "^xray"; then
+            ip netns exec xray ip link delete awg0 2>/dev/null || true
+            ip netns exec xray ip link delete veth-ns 2>/dev/null || true
+        fi
         ip link delete veth-host 2>/dev/null || true
-        ip link delete veth-ns 2>/dev/null || true
+        ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
         return 1
     fi
 
@@ -496,6 +517,55 @@ check_namespace_health() {
     fi
     
     return 0
+}
+
+# ============================================================================
+# ИСПРАВЛЕНО v6.1.0: Полная очистка всех сервисов и интерфейсов
+# ============================================================================
+
+cleanup_all() {
+    log "Полная очистка всех сервисов и интерфейсов..."
+    
+    # 1. Остановка ВСЕХ сервисов (включая awg-quick@awg0!)
+    log "Остановка сервисов..."
+    systemctl stop xray.service hysteria-server.service socat-443.service socat-8443.service 2>/dev/null || true
+    systemctl stop awg-quick@awg0.service 2>/dev/null || true
+    sleep 2
+    
+    # 2. Удаление интерфейсов ВНУТРИ namespace (до удаления самого namespace)
+    if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
+        log "Удаление интерфейсов внутри namespace '$NAMESPACE'..."
+        ip netns exec "$NAMESPACE" ip link delete awg0 2>/dev/null || true
+        ip netns exec "$NAMESPACE" ip link delete veth-ns 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # 3. Удаление veth-host в основном namespace
+    log "Удаление veth-пары..."
+    ip link delete veth-host 2>/dev/null || true
+    ip link delete veth-ns 2>/dev/null || true
+    sleep 1
+    
+    # 4. Удаление namespace
+    log "Удаление namespace '$NAMESPACE'..."
+    ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
+    sleep 2
+    
+    # 5. Проверка, что всё очищено
+    if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
+        warn "Namespace '$NAMESPACE' всё ещё существует, принудительное удаление..."
+        rm -f "/run/netns/$NAMESPACE" || true
+    fi
+    
+    if ip link show awg0 2>/dev/null | grep -q "awg0"; then
+        warn "Интерфейс awg0 всё ещё существует в основном namespace"
+    fi
+    
+    if ip link show veth-host 2>/dev/null | grep -q "veth-host"; then
+        warn "Интерфейс veth-host всё ещё существует"
+    fi
+    
+    log "✓ Полная очистка завершена"
 }
 
 # ============================================================================
@@ -1309,7 +1379,6 @@ log "✓ Сервисы созданы (Xray и Hysteria2 в namespace)"
 
 section "Шаг 15: Настройка veth-пары и socat"
 
-# ИСПРАВЛЕНО v6.0.9: Улучшенная обработка существующей veth-пары
 cat > /usr/local/bin/setup-socat-forward.sh << SOCAT_EOF
 #!/usr/bin/env bash
 set -e
@@ -1318,31 +1387,25 @@ NAMESPACE="xray"
 VETH_HOST_IP="$VETH_HOST_IP"
 VETH_NS_IP="$VETH_NS_IP"
 
-# Проверка существования namespace
 if ! ip netns list 2>/dev/null | grep -q "^\$NAMESPACE"; then
     echo "ERROR: Namespace \$NAMESPACE не существует"
     exit 1
 fi
 
-# ИСПРАВЛЕНО v6.0.9: Принудительное удаление существующей veth-пары
-# Это решает проблему "RTNETLINK answers: File exists" при повторном запуске
 echo "Проверка существующей veth-пары..."
 
-# Удаляем veth-host в основном namespace (игнорируя ошибки)
 if ip link show veth-host 2>/dev/null | grep -q "veth-host"; then
     echo "Удаление существующего veth-host..."
     ip link delete veth-host 2>/dev/null || true
     sleep 1
 fi
 
-# Удаляем veth-ns внутри namespace (игнорируя ошибки)
 if ip netns exec \$NAMESPACE ip link show veth-ns 2>/dev/null | grep -q "veth-ns"; then
     echo "Удаление существующего veth-ns внутри namespace..."
     ip netns exec \$NAMESPACE ip link delete veth-ns 2>/dev/null || true
     sleep 1
 fi
 
-# Дополнительная очистка на случай, если veth-ns остался в другом состоянии
 ip link delete veth-ns 2>/dev/null || true
 sleep 1
 
@@ -1356,7 +1419,6 @@ ip link set veth-host up
 ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns
 ip netns exec \$NAMESPACE ip link set veth-ns up
 
-# ИСПРАВЛЕНО v6.0.9: Явный маршрут для veth-подсети внутри namespace
 ip netns exec \$NAMESPACE ip route add 10.200.0.0/24 dev veth-ns
 
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-forwarding.conf
@@ -1424,25 +1486,17 @@ log "✓ Socat сервисы созданы (Type=simple, foreground, bind=0.0.
 
 section "Шаг 16: Запуск всех сервисов"
 
-log "Остановка всех сервисов перед проверкой..."
-systemctl stop xray.service hysteria-server.service socat-443.service socat-8443.service 2>/dev/null || true
-sleep 2
-
-# ИСПРАВЛЕНО v6.0.9: Принудительная очистка перед пересозданием
-log "Принудительная очистка namespace и veth-пары..."
-ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
-ip link delete veth-host 2>/dev/null || true
-ip link delete veth-ns 2>/dev/null || true
-sleep 1
+# ИСПРАВЛЕНО v6.1.0: Используем функцию cleanup_all для полной очистки
+cleanup_all
 
 if ! check_namespace_health; then
-    log "Namespace не работает, пересоздаем..."
+    log "Namespace не работает, создаем..."
     /usr/local/bin/setup-awg-namespace.sh
 else
-    log "✓ Namespace уже работает, пропускаем пересоздание"
+    log "✓ Namespace уже работает, пропускаем создание"
 fi
 
-log "Создание veth-пары (до запуска Xray)..."
+log "Создание veth-пары..."
 /usr/local/bin/setup-socat-forward.sh
 
 log "Запуск Xray..."
@@ -1908,7 +1962,7 @@ cmd_update() {
 }
 
 cmd_version() {
-    echo "xray-admin v6.0.9"
+    echo "xray-admin v6.1.0"
     echo "VPN Relay Manager (Вариант B: Namespace + veth + socat)"
     echo ""
     echo "Установленные компоненты:"
@@ -1931,7 +1985,7 @@ cmd_version() {
 }
 
 cmd_help() {
-    echo -e "${CYAN}xray-admin v6.0.9 - Управление VPN Relay${NC}"
+    echo -e "${CYAN}xray-admin v6.1.0 - Управление VPN Relay${NC}"
     echo ""
     echo "Команды:"
     echo "  status              - Статус всех сервисов"
@@ -1979,7 +2033,7 @@ log "✓ Управляющий скрипт создан: $ADMIN_BIN"
 section "✅ Установка завершена успешно!"
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  VPN Relay v6.0.9 (Вариант B: Namespace + veth)   ║${NC}"
+echo -e "${GREEN}║  VPN Relay v6.1.0 (Вариант B: Namespace + veth)   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -2057,16 +2111,21 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Скрипт v6.0.9 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Скрипт v6.1.0 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
-print(f"\n🔧 Ключевые исправления в v6.0.9:")
-print(f"  ✓ ИСПРАВЛЕНО: Решение проблемы 'RTNETLINK answers: File exists'")
-print(f"    - Принудительное удаление veth-host и veth-ns перед созданием")
-print(f"    - Проверка veth-ns внутри namespace")
-print(f"    - Дополнительная очистка на случай зависших интерфейсов")
-print(f"  ✓ Улучшенная диагностика:")
-print(f"    - Добавлена проверка veth-ns внутри namespace")
-print(f"    - Добавлена проверка существования namespace")
-print(f"  ✓ Принудительная очистка в Шаге 16 перед пересозданием")
+print(f"\n🔧 Ключевые исправления в v6.1.0:")
+print(f"  ✓ ИСПРАВЛЕНО: Добавлена функция cleanup_all() для полной очистки")
+print(f"    - Остановка ВСЕХ сервисов (включая awg-quick@awg0)")
+print(f"    - Удаление интерфейсов ВНУТРИ namespace перед удалением namespace")
+print(f"    - Удаление veth-пары")
+print(f"    - Удаление namespace")
+print(f"    - Проверка, что всё очищено")
+print(f"  ✓ Улучшенный rollback:")
+print(f"    - Принудительная очистка даже при отсутствии бэкапа")
+print(f"    - Корректная последовательность удаления интерфейсов")
+print(f"  ✓ Расширенная диагностика:")
+print(f"    - Добавлена проверка awg0 в namespace xray")
+print(f"    - Добавлена проверка процессов awg")
+print(f"    - Добавлены логи сервиса awg-quick@awg0")
 PYEOF
