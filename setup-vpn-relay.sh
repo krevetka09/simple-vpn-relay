@@ -1745,7 +1745,7 @@ log "Установка завершена успешно"
 with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
-os.chmod('/root/setup-vpn-relай.sh', 0o755)
+os.chmod('/root/setup-vpn-relаy.sh', 0o755)
 print(f"✅ Скрипт v6.0.0 (Вариант B) создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
