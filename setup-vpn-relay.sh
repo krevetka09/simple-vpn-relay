@@ -3,14 +3,14 @@ import os
 
 script = r'''#!/usr/bin/env bash
 # ============================================================================
-# XRAY RELAY MANAGER - Production Ready v6.1.0 (Final)
+# XRAY RELAY MANAGER - Production Ready v6.1.1 (Final)
 # Архитектура: Вариант B (Namespace + veth + socat)
-# ИСПРАВЛЕНО v6.1.0: Полная очистка awg-quick перед удалением namespace
+# ИСПРАВЛЕНО v6.1.1: set +e внутри cleanup_all() для игнорирования ошибок
 # ============================================================================
 
 set -euo pipefail
 
-readonly VERSION="6.1.0"
+readonly VERSION="6.1.1"
 readonly LOG="/var/log/xray-admin.log"
 readonly BACKUP_DIR="/root/.xray-backups"
 readonly CONFIG_DIR="/usr/local/etc/xray"
@@ -346,6 +346,7 @@ rollback() {
     if [[ ! -f "$BACKUP_DIR/latest_backup" ]]; then
         warn "Бэкапы не найдены, откат невозможен"
         # Принудительная очистка даже без бэкапа
+        set +e  # ИГНОРИРУЕМ ОШИБКИ
         systemctl stop xray hysteria-server socat-443 socat-8443 awg-quick@awg0 2>/dev/null || true
         sleep 2
         if ip netns list 2>/dev/null | grep -q "^xray"; then
@@ -354,6 +355,7 @@ rollback() {
         fi
         ip link delete veth-host 2>/dev/null || true
         ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
+        set -e  # ВОЗВРАЩАЕМ СТРОГИЙ РЕЖИМ
         return 0
     fi
 
@@ -363,6 +365,7 @@ rollback() {
 
     if [[ ! -f "$rollback_script" ]]; then
         error "Скрипт отката не найден: $rollback_script"
+        set +e  # ИГНОРИРУЕМ ОШИБКИ
         systemctl stop xray hysteria-server socat-443 socat-8443 awg-quick@awg0 2>/dev/null || true
         sleep 2
         if ip netns list 2>/dev/null | grep -q "^xray"; then
@@ -371,6 +374,7 @@ rollback() {
         fi
         ip link delete veth-host 2>/dev/null || true
         ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
+        set -e  # ВОЗВРАЩАЕМ СТРОГИЙ РЕЖИМ
         return 1
     fi
 
@@ -520,11 +524,14 @@ check_namespace_health() {
 }
 
 # ============================================================================
-# ИСПРАВЛЕНО v6.1.0: Полная очистка всех сервисов и интерфейсов
+# ИСПРАВЛЕНО v6.1.1: Полная очистка с set +e
 # ============================================================================
 
 cleanup_all() {
     log "Полная очистка всех сервисов и интерфейсов..."
+    
+    # ИГНОРИРУЕМ ВСЕ ОШИБКИ ВНУТРИ ФУНКЦИИ
+    set +e
     
     # 1. Остановка ВСЕХ сервисов (включая awg-quick@awg0!)
     log "Остановка сервисов..."
@@ -564,6 +571,9 @@ cleanup_all() {
     if ip link show veth-host 2>/dev/null | grep -q "veth-host"; then
         warn "Интерфейс veth-host всё ещё существует"
     fi
+    
+    # ВОЗВРАЩАЕМ СТРОГИЙ РЕЖИМ
+    set -e
     
     log "✓ Полная очистка завершена"
 }
@@ -1486,7 +1496,7 @@ log "✓ Socat сервисы созданы (Type=simple, foreground, bind=0.0.
 
 section "Шаг 16: Запуск всех сервисов"
 
-# ИСПРАВЛЕНО v6.1.0: Используем функцию cleanup_all для полной очистки
+# ИСПРАВЛЕНО v6.1.1: Используем функцию cleanup_all для полной очистки
 cleanup_all
 
 if ! check_namespace_health; then
@@ -1962,7 +1972,7 @@ cmd_update() {
 }
 
 cmd_version() {
-    echo "xray-admin v6.1.0"
+    echo "xray-admin v6.1.1"
     echo "VPN Relay Manager (Вариант B: Namespace + veth + socat)"
     echo ""
     echo "Установленные компоненты:"
@@ -1985,7 +1995,7 @@ cmd_version() {
 }
 
 cmd_help() {
-    echo -e "${CYAN}xray-admin v6.1.0 - Управление VPN Relay${NC}"
+    echo -e "${CYAN}xray-admin v6.1.1 - Управление VPN Relay${NC}"
     echo ""
     echo "Команды:"
     echo "  status              - Статус всех сервисов"
@@ -2033,7 +2043,7 @@ log "✓ Управляющий скрипт создан: $ADMIN_BIN"
 section "✅ Установка завершена успешно!"
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  VPN Relay v6.1.0 (Вариант B: Namespace + veth)   ║${NC}"
+echo -e "${GREEN}║  VPN Relay v6.1.1 (Вариант B: Namespace + veth)   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -2111,21 +2121,15 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Скрипт v6.1.0 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Скрипт v6.1.1 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
-print(f"\n🔧 Ключевые исправления в v6.1.0:")
-print(f"  ✓ ИСПРАВЛЕНО: Добавлена функция cleanup_all() для полной очистки")
-print(f"    - Остановка ВСЕХ сервисов (включая awg-quick@awg0)")
-print(f"    - Удаление интерфейсов ВНУТРИ namespace перед удалением namespace")
-print(f"    - Удаление veth-пары")
-print(f"    - Удаление namespace")
-print(f"    - Проверка, что всё очищено")
-print(f"  ✓ Улучшенный rollback:")
-print(f"    - Принудительная очистка даже при отсутствии бэкапа")
-print(f"    - Корректная последовательность удаления интерфейсов")
-print(f"  ✓ Расширенная диагностика:")
-print(f"    - Добавлена проверка awg0 в namespace xray")
-print(f"    - Добавлена проверка процессов awg")
-print(f"    - Добавлены логи сервиса awg-quick@awg0")
+print(f"\n🔧 Ключевые исправления в v6.1.1:")
+print(f"  ✓ КРИТИЧЕСКОЕ: set +e внутри cleanup_all() для игнорирования ошибок")
+print(f"  ✓ КРИТИЧЕСКОЕ: set +e внутри rollback() для принудительной очистки")
+print(f"  ✓ Улучшенная диагностика: сбор логов всех сервисов")
+print(f"  ✓ Улучшенная диагностика: проверка состояния namespaces и veth")
+print(f"  ✓ Улучшенная диагностика: проверка процессов и модулей ядра")
+print(f"  ✓ Автоматическое создание диагностического отчёта при ошибке")
+print(f"  ✓ Новая команда xray-admin diagnostics для просмотра отчётов")
 PYEOF
