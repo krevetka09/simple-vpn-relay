@@ -594,7 +594,7 @@ echo "Хост: $(hostname)" >> "$LOG"
 create_backup
 
 # ============================================================================
-# ШАГ 1-13: УСТАНОВКА (без изменений)
+# ШАГ 1-13: УСТАНОВКА
 # ============================================================================
 
 section "Шаг 1: Проверка DNS"
@@ -1858,3 +1858,150 @@ cmd_version() {
     echo ""
     echo "Архитектура:"
     echo "  • Xray/Hysteria2 в namespace 'xray'"
+    echo "  • veth-пара для связи namespaces"
+    echo "  • Socat пробрасывает 443/8443 через veth"
+    echo "  • Трафик через AmneziaWG на РФ relay"
+    echo ""
+    echo "Диагностика:"
+    echo "  • Бэкапы: $BACKUP_DIR"
+    echo "  • Отчёты: $DIAGNOSTICS_DIR"
+    echo "  • Лог: $LOG_FILE"
+}
+
+cmd_help() {
+    echo -e "${CYAN}xray-admin v6.3.0 - VPN Relay Manager${NC}"
+    echo ""
+    echo "Команды:"
+    echo "  status              - Статус сервисов"
+    echo "  add <имя>           - Добавить клиента"
+    echo "  remove <имя>        - Удалить клиента"
+    echo "  rename <стар> <нов> - Переименовать"
+    echo "  links [имя]         - Ссылки для подключения"
+    echo "  restart             - Перезапустить всё"
+    echo "  monitor             - Мониторинг"
+    echo "  alerts              - Настроить оповещения"
+    echo "  restore             - Восстановить из бэкапа"
+    echo "  diagnostics         - Показать отчёт"
+    echo "  update              - Обновить Xray"
+    echo "  version             - Версия компонентов"
+    echo "  help                - Эта справка"
+    echo ""
+    echo "Примеры:"
+    echo "  xray-admin add my-phone"
+    echo "  xray-admin links admin"
+    echo "  xray-admin status"
+    echo "  xray-admin diagnostics"
+}
+
+case "${1:-help}" in
+    status)     cmd_status ;;
+    add)        cmd_add_client "${2:-}" ;;
+    remove)     cmd_remove_client "${2:-}" ;;
+    rename)     cmd_rename_client "${2:-}" "${3:-}" ;;
+    links)      cmd_gen_links "${2:-all}" ;;
+    restart)    cmd_restart ;;
+    monitor)    cmd_monitor ;;
+    alerts)     cmd_setup_alerts ;;
+    restore)    cmd_restore ;;
+    diagnostics) cmd_diagnostics ;;
+    update)     cmd_update ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h|"") cmd_help ;;
+    *)          echo "Неизвестная команда: $1"; cmd_help; exit 1 ;;
+esac
+ADMINEOF
+
+chmod +x "$ADMIN_BIN"
+log "✓ Управляющий скрипт: $ADMIN_BIN"
+
+section "✅ Установка завершена!"
+
+echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║  VPN Relay v6.3.0 (Namespace + veth + socat)       ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+echo -e "${YELLOW}Архитектура:${NC}"
+echo "  📱 Клиент → eth0:443/8443 (основной интерфейс)"
+echo "       ↓"
+echo "  🔌 Socat (TCP/UDP) с ExecStartPre=sleep 10"
+echo "       ↓"
+echo "  🌐 veth-host (10.200.0.1) ↔ veth-ns (10.200.0.2)"
+echo "       ↓"
+echo "  📦 Namespace 'xray' (изолированная среда)"
+echo "       ├── Xray (порт 443, VLESS-REALITY)"
+echo "       ├── Hysteria2 (порт 8443, UDP)"
+echo "       └── awg0 (AmneziaWG туннель)"
+echo "              ↓"
+echo "  🇷🇺 РФ relay ($RELAY_IP)"
+echo "              ↓"
+echo "  🌐 Интернет"
+echo ""
+
+echo -e "${YELLOW}Статус:${NC}"
+printf "  %-30s %s\n" "AmneziaWG (relay):" "$(relay_ssh 'systemctl is-active amneziawg@awg0' 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "AmneziaWG (client):" "$(systemctl is-active awg-quick@awg0 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Xray:" "$(systemctl is-active xray 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Socat-443:" "$(systemctl is-active socat-443.service 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Socat-8443:" "$(systemctl is-active socat-8443.service 2>/dev/null || echo 'inactive')"
+echo ""
+
+echo -e "${YELLOW}IP информация:${NC}"
+printf "  %-30s %s\n" "РФ relay:" "$RELAY_IP"
+printf "  %-30s %s\n" "Xray через туннель:" "$TUNNEL_IP"
+printf "  %-30s %s\n" "veth-host:" "$VETH_HOST_IP"
+printf "  %-30s %s\n" "veth-ns:" "$VETH_NS_IP"
+echo ""
+
+echo -e "${YELLOW}Порты:${NC}"
+ss -tlnp | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет TCP"
+ss -ulnp | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет UDP"
+echo ""
+
+echo -e "${YELLOW}Управление:${NC}"
+echo "  xray-admin status         # Статус"
+echo "  xray-admin add user       # Добавить"
+echo "  xray-admin remove user    # Удалить"
+echo "  xray-admin rename old new # Переименовать"
+echo "  xray-admin links          # Ссылки"
+echo "  xray-admin restart        # Перезапуск"
+echo "  xray-admin monitor        # Мониторинг"
+echo "  xray-admin alerts         # Оповещения"
+echo "  xray-admin diagnostics    # Отчёт"
+echo "  xray-admin version        # Версия"
+echo "  xray-admin restore        # Восстановить"
+echo "  xray-admin help           # Помощь"
+echo ""
+
+echo -e "${YELLOW}Диагностика:${NC}"
+echo "  • Бэкапы: $BACKUP_DIR"
+echo "  • Отчёты: $DIAGNOSTICS_DIR"
+echo "  • Лог: $LOG"
+echo ""
+
+echo -e "${YELLOW}Безопасность:${NC}"
+echo "  • SSH ключи"
+echo "  • Изоляция в namespace"
+echo "  • veth-пара для связи"
+echo "  • Трафик через туннель"
+echo ""
+
+echo -e "${GREEN}✓ Готово!${NC}"
+log "Установка завершена"
+'''
+
+with open('/root/setup-vpn-relay.sh', 'w') as f:
+    f.write(script)
+
+os.chmod('/root/setup-vpn-relay.sh', 0o755)
+print(f"✅ Скрипт v6.3.0 создан: /root/setup-vpn-relay.sh")
+print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
+print(f"📝 Строк: {script.count(chr(10))}")
+print(f"\n🔧 Ключевые исправления в v6.3.0:")
+print(f"  ✓ Reverse-stop для сервисов")
+print(f"  ✓ Отдельный cleanup для AWG")
+print(f"  ✓ Idempotent-функция для netns/veth")
+print(f"  ✓ Жёсткие зависимости After=/Requires= для socat")
+print(f"  ✓ Правильный порядок запуска: AWG → namespace → Xray/Hysteria → socat")
+PYEOF
