@@ -3,14 +3,14 @@ import os
 
 script = r'''#!/usr/bin/env bash
 # ============================================================================
-# XRAY RELAY MANAGER - Production Ready v6.2.1 (Final)
+# XRAY RELAY MANAGER - Production Ready v6.2.2 (Final)
 # Архитектура: Вариант B (Namespace + veth + socat)
-# ИСПРАВЛЕНО v6.2.1: Убран set -e из setup-socat-forward.sh
+# ИСПРАВЛЕНО v6.2.2: Принудительное удаление veth-пары перед созданием
 # ============================================================================
 
 set -euo pipefail
 
-readonly VERSION="6.2.1"
+readonly VERSION="6.2.2"
 readonly LOG="/var/log/xray-admin.log"
 readonly BACKUP_DIR="/root/.xray-backups"
 readonly CONFIG_DIR="/usr/local/etc/xray"
@@ -23,7 +23,6 @@ readonly VETH_HOST_IP="10.200.0.1"
 readonly VETH_NS_IP="10.200.0.2"
 readonly DIAGNOSTICS_DIR="/root/.xray-diagnostics"
 
-# Массивы сервисов для единого управления
 readonly CORE_SERVICES=(xray hysteria-server)
 readonly SOCAT_SERVICES=(socat-443 socat-8443)
 readonly ALL_SERVICES=(xray hysteria-server socat-443 socat-8443 wg-namespace awg-quick@awg0)
@@ -33,7 +32,6 @@ RELAY_IP=""
 RELAY_AUTH=""
 PKG_MANAGER=""
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q -o ServerAliveInterval=30 -o ServerAliveCountMax=3"
-SYSTEMCTL_TIMEOUT="30s"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,10 +49,6 @@ section() {
     echo -e "${CYAN}║  $*${NC}" | tee -a "$LOG"
     echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}\n" | tee -a "$LOG"
 }
-
-# ============================================================================
-# ОПТИМИЗИРОВАННАЯ ДИАГНОСТИКА
-# ============================================================================
 
 collect_diagnostics() {
     local ts diag_file
@@ -182,10 +176,6 @@ collect_diagnostics() {
     log "✓ Диагностический отчёт: $diag_file"
 }
 
-# ============================================================================
-# БЕКАПЫ И ОТКАТ (ОПТИМИЗИРОВАНО)
-# ============================================================================
-
 create_backup() {
     local ts
     ts=$(date +%Y%m%d_%H%M%S)
@@ -303,10 +293,6 @@ rollback() {
 
 trap 'error "Критическая ошибка на строке $LINENO"; rollback' ERR
 
-# ============================================================================
-# SSH ФУНКЦИИ (ОПТИМИЗИРОВАНО)
-# ============================================================================
-
 validate_ssh_auth() {
     if [[ -f "$RELAY_AUTH" ]]; then
         [[ ! -r "$RELAY_AUTH" ]] && die "SSH ключ не читается: $RELAY_AUTH"
@@ -344,10 +330,6 @@ relay_scp() {
         sshpass -f <(printf '%s' "$RELAY_AUTH") scp $SSH_OPTS "$src" root@"$RELAY_IP":"$dst" 2>/dev/null
     fi
 }
-
-# ============================================================================
-# МЕХАНИЗМ ПОВТОРНЫХ ПОПЫТОК
-# ============================================================================
 
 retry_cmd() {
     local max_attempts="${1:-3}" delay="${2:-5}"
@@ -413,10 +395,7 @@ check_namespace_health() {
     return 0
 }
 
-# ============================================================================
-# ОПТИМИЗИРОВАННАЯ ОЧИСТКА
-# ============================================================================
-
+# ИСПРАВЛЕНО v6.2.2: Правильный порядок удаления veth-пары
 cleanup_all() {
     log "Полная очистка сервисов и интерфейсов..."
     set +e
@@ -427,6 +406,12 @@ cleanup_all() {
     done
     sleep 2
     
+    # ИСПРАВЛЕНО v6.2.2: Удаление veth-host ДО удаления namespace
+    log "Удаление veth-пары..."
+    ip link delete veth-host 2>/dev/null || true
+    sleep 1
+    
+    # Удаление интерфейсов внутри namespace
     if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
         log "Удаление интерфейсов в namespace '$NAMESPACE'..."
         ip netns exec "$NAMESPACE" ip link delete awg0 2>/dev/null || true
@@ -434,15 +419,12 @@ cleanup_all() {
         sleep 1
     fi
     
-    log "Удаление veth-пары..."
-    ip link delete veth-host 2>/dev/null || true
-    ip link delete veth-ns 2>/dev/null || true
-    sleep 1
-    
+    # Удаление namespace
     log "Удаление namespace '$NAMESPACE'..."
     ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" || true
     sleep 2
     
+    # Проверка очистки
     ip netns list 2>/dev/null | grep -q "^$NAMESPACE" && \
         warn "Namespace '$NAMESPACE' всё ещё существует" && \
         rm -f "/run/netns/$NAMESPACE" || true
@@ -453,10 +435,6 @@ cleanup_all() {
     set -e
     log "✓ Полная очистка завершена"
 }
-
-# ============================================================================
-# ПАКЕТНЫЙ МЕНЕДЖЕР
-# ============================================================================
 
 detect_package_manager() {
     if command -v apt-get &> /dev/null; then
@@ -484,10 +462,6 @@ pkg_install() {
     esac
 }
 
-# ============================================================================
-# ПРОВЕРКА ПАРАМЕТРОВ
-# ============================================================================
-
 if [[ $# -lt 2 ]]; then
     echo "Использование: $0 <IP_РФ_сервера> <SSH_пароль_или_ключ>"
     echo ""
@@ -506,10 +480,6 @@ echo "Начало: $(date)" >> "$LOG"
 echo "Хост: $(hostname)" >> "$LOG"
 
 create_backup
-
-# ============================================================================
-# ШАГ 1-13: УСТАНОВКА (без изменений)
-# ============================================================================
 
 section "Шаг 1: Проверка DNS"
 
@@ -1058,10 +1028,6 @@ EOF
     fi
 fi
 
-# ============================================================================
-# ШАГ 14-15: SYSTEMD + VETH + SOCAT (ИСПРАВЛЕНО v6.2.1)
-# ============================================================================
-
 section "Шаг 14: Создание systemd сервисов"
 
 cat > /usr/local/bin/setup-awg-namespace.sh << 'NSEOF'
@@ -1165,12 +1131,12 @@ systemctl daemon-reload
 systemctl enable wg-namespace.service xray.service hysteria-server.service > /dev/null 2>&1
 log "✓ Сервисы созданы (линейная цепочка: wg-namespace → xray → socat)"
 
-section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.2.1)"
+section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.2.2)"
 
-# ИСПРАВЛЕНО v6.2.1: Убран set -e из setup-socat-forward.sh
+# ИСПРАВЛЕНО v6.2.2: Принудительное удаление существующих интерфейсов
 cat > /usr/local/bin/setup-socat-forward.sh << SOCAT_EOF
 #!/usr/bin/env bash
-# ИСПРАВЛЕНО v6.2.1: Убран set -e, чтобы скрипт не выходил при ошибках
+# ИСПРАВЛЕНО v6.2.2: Убран set -e, принудительное удаление существующих интерфейсов
 
 NAMESPACE="xray"
 VETH_HOST_IP="$VETH_HOST_IP"
@@ -1178,60 +1144,82 @@ VETH_NS_IP="$VETH_NS_IP"
 
 ip netns list 2>/dev/null | grep -q "^\$NAMESPACE" || { echo "ERROR: Namespace не существует"; exit 1; }
 
-echo "Проверка veth-пары..."
+echo "Принудительное удаление существующих veth-интерфейсов..."
 
-# Удаление существующих интерфейсов
-ip link show veth-host 2>/dev/null | grep -q "veth-host" && {
-    echo "Удаление veth-host..."
-    ip link delete veth-host 2>/dev/null || true
-    sleep 1
-}
-
-ip netns exec \$NAMESPACE ip link show veth-ns 2>/dev/null | grep -q "veth-ns" && {
-    echo "Удаление veth-ns в namespace..."
-    ip netns exec \$NAMESPACE ip link delete veth-ns 2>/dev/null || true
-    sleep 1
-}
-
-ip link delete veth-ns 2>/dev/null || true
+# ИСПРАВЛЕНО v6.2.2: Принудительное удаление veth-host ДО создания новой пары
+ip link delete veth-host 2>/dev/null || true
 sleep 1
 
-echo "Создание veth-пары..."
-ip link add veth-host type veth peer name veth-ns || { echo "ERROR: Не удалось создать veth-пару"; exit 1; }
-ip link set veth-ns netns \$NAMESPACE || { echo "ERROR: Не удалось переместить veth-ns"; exit 1; }
+# Удаление veth-ns в namespace (если существует)
+ip netns exec \$NAMESPACE ip link delete veth-ns 2>/dev/null || true
+sleep 1
 
-ip addr add \$VETH_HOST_IP/24 dev veth-host || { echo "ERROR: Не удалось назначить IP veth-host"; exit 1; }
-ip link set veth-host up || { echo "ERROR: Не удалось поднять veth-host"; exit 1; }
+echo "Создание новой veth-пары..."
+ip link add veth-host type veth peer name veth-ns || {
+    echo "ERROR: Не удалось создать veth-пару"
+    exit 1
+}
 
-ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns || { echo "ERROR: Не удалось назначить IP veth-ns"; exit 1; }
-ip netns exec \$NAMESPACE ip link set veth-ns up || { echo "ERROR: Не удалось поднять veth-ns"; exit 1; }
+ip link set veth-ns netns \$NAMESPACE || {
+    echo "ERROR: Не удалось переместить veth-ns"
+    exit 1
+}
 
-# КРИТИЧНО: Явный маршрут для veth-подсети
-ip netns exec \$NAMESPACE ip route add 10.200.0.0/24 dev veth-ns || { echo "ERROR: Не удалось добавить маршрут"; exit 1; }
+ip addr add \$VETH_HOST_IP/24 dev veth-host || {
+    echo "ERROR: Не удалось назначить IP veth-host"
+    exit 1
+}
+ip link set veth-host up || {
+    echo "ERROR: Не удалось поднять veth-host"
+    exit 1
+}
+
+ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns || {
+    echo "ERROR: Не удалось назначить IP veth-ns"
+    exit 1
+}
+ip netns exec \$NAMESPACE ip link set veth-ns up || {
+    echo "ERROR: Не удалось поднять veth-ns"
+    exit 1
+}
+
+# ИСПРАВЛЕНО v6.2.2: Удаление существующего маршрута перед добавлением нового
+echo "Настройка маршрутов..."
+ip netns exec \$NAMESPACE ip route flush 10.200.0.0/24 2>/dev/null || true
+ip netns exec \$NAMESPACE ip route add 10.200.0.0/24 dev veth-ns || {
+    echo "WARNING: Не удалось добавить маршрут (возможно уже существует)"
+}
 
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-forwarding.conf
 sysctl --system > /dev/null 2>&1 || true
 
-# ИСПРАВЛЕНО v6.2.1: Установить rp_filter = 0
 sysctl -w net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
 
-iptables -A FORWARD -i veth-host -o veth-ns -j ACCEPT || true
-iptables -A FORWARD -i veth-ns -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT || true
+iptables -A FORWARD -i veth-host -o veth-ns -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i veth-ns -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
 echo "✓ veth-пара: \$VETH_HOST_IP <-> \$VETH_NS_IP"
 
-# ИСПРАВЛЕНО v6.2.1: Не выходить при ошибке ping
+# Проверка, что veth-пара действительно создана
+if ! ip link show veth-host >/dev/null 2>&1; then
+    echo "ERROR: veth-host не создан"
+    exit 1
+fi
+
+if ! ip netns exec \$NAMESPACE ip link show veth-ns >/dev/null 2>&1; then
+    echo "ERROR: veth-ns не создан в namespace"
+    exit 1
+fi
+
 if ! ping -c 1 -W 2 \$VETH_NS_IP >/dev/null 2>&1; then
     echo "WARNING: Ping не проходит, но veth-пара создана"
 fi
 echo "✓ Связь установлена"
 
-# ИСПРАВЛЕНО v6.2.1: Не выходить при отсутствии netfilter-persistent
 which netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
 echo "✓ veth настроена"
 
-# ИСПРАВЛЕНО v6.2.1: Всегда возвращать 0
 exit 0
 SOCAT_EOF
 chmod +x /usr/local/bin/setup-socat-forward.sh
@@ -1274,10 +1262,6 @@ systemctl daemon-reload
 systemctl enable socat-443.service socat-8443.service > /dev/null 2>&1
 log "✓ Socat сервисы (Type=simple, ExecStartPre=sleep 10)"
 
-# ============================================================================
-# ШАГ 16-17: ЗАПУСК + SMOKE ТЕСТЫ (ИСПРАВЛЕНО v6.2.1)
-# ============================================================================
-
 section "Шаг 16: Запуск всех сервисов"
 
 cleanup_all
@@ -1290,15 +1274,15 @@ else
 fi
 
 log "Создание veth-пары..."
-# ИСПРАВЛЕНО v6.2.1: Игнорировать ошибки setup-socat-forward.sh
-/usr/local/bin/setup-socat-forward.sh || warn "setup-socat-forward.sh завершился с предупреждениями"
+/usr/local/bin/setup-socat-forward.sh || {
+    error "setup-socat-forward.sh завершился с ошибкой"
+    die "Не удалось создать veth-пару"
+}
 
-# Запуск Xray
 log "Запуск Xray..."
 systemctl start xray
 wait_for_service xray 30 || die "Xray не запустился"
 
-# Проверка порта 443 в namespace
 log "Проверка порта 443 в namespace..."
 for i in {1..10}; do
     if ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
@@ -1309,22 +1293,18 @@ for i in {1..10}; do
     sleep 1
 done
 
-# Запуск Hysteria2
 log "Запуск Hysteria2..."
 systemctl start hysteria-server
 wait_for_service hysteria-server 30 || warn "Hysteria2 не запустился"
 
-# Ожидание перед запуском socat
 log "Ожидание готовности сервисов (5s)..."
 sleep 5
 
-# Запуск socat
 log "Запуск socat..."
 systemctl start socat-443.service socat-8443.service
 wait_for_service socat-443.service 15 || die "Socat-443 не запустился"
 wait_for_service socat-8443.service 15 || warn "Socat-8443 не запустился"
 
-# Проверка логов socat
 log "Проверка логов socat..."
 if journalctl -u socat-443.service -n 10 --no-pager | grep -qi "error\|failed\|refused"; then
     error "Socat-443 упал:"
@@ -1332,7 +1312,6 @@ if journalctl -u socat-443.service -n 10 --no-pager | grep -qi "error\|failed\|r
     die "Socat-443 не работает"
 fi
 
-# Проверка портов
 log "Проверка портов..."
 ss -tlnp | grep -q ":443.*socat" || {
     error "Socat не слушает порт 443"
@@ -1343,7 +1322,6 @@ ss -tlnp | grep -q ":443.*socat" || {
 wait_for_port 443 tcp 30 || die "Порт 443/tcp не готов"
 wait_for_port 8443 udp 30 || warn "Порт 8443/udp не готов"
 
-# Финальные проверки
 systemctl is-active --quiet xray && log "✓ Xray запущен" || warn "Xray не запущен"
 systemctl is-active --quiet hysteria-server && log "✓ Hysteria2 запущен" || warn "Hysteria2 не запущен"
 systemctl is-active --quiet socat-443.service && systemctl is-active --quiet socat-8443.service && \
@@ -1410,10 +1388,6 @@ if [[ "$SMOKE_PASSED" == "false" ]]; then
 else
     log "✅ Все smoke тесты пройдены!"
 fi
-
-# ============================================================================
-# ШАГ 18: XRAY-ADMIN (ОПТИМИЗИРОВАНО)
-# ============================================================================
 
 section "Шаг 18: Управляющий скрипт"
 
@@ -1693,7 +1667,7 @@ cmd_update() {
 }
 
 cmd_version() {
-    echo "xray-admin v6.2.1"
+    echo "xray-admin v6.2.2"
     echo "VPN Relay Manager (Namespace + veth + socat)"
     echo ""
     echo "Компоненты:"
@@ -1715,7 +1689,7 @@ cmd_version() {
 }
 
 cmd_help() {
-    echo -e "${CYAN}xray-admin v6.2.1 - VPN Relay Manager${NC}"
+    echo -e "${CYAN}xray-admin v6.2.2 - VPN Relay Manager${NC}"
     echo ""
     echo "Команды:"
     echo "  status              - Статус сервисов"
@@ -1763,7 +1737,7 @@ log "✓ Управляющий скрипт: $ADMIN_BIN"
 section "✅ Установка завершена!"
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  VPN Relay v6.2.1 (Namespace + veth + socat)       ║${NC}"
+echo -e "${GREEN}║  VPN Relay v6.2.2 (Namespace + veth + socat)       ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -1841,14 +1815,13 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Скрипт v6.2.1 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Скрипт v6.2.2 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
-print(f"\n🔧 Ключевые исправления в v6.2.1:")
-print(f"  ✓ Убран set -e из setup-socat-forward.sh")
-print(f"  ✓ Добавлены явные проверки с exit 1 при критических ошибках")
-print(f"  ✓ Игнорирование ошибок ping и netfilter-persistent")
-print(f"  ✓ Установка rp_filter = 0 для veth-host")
-print(f"  ✓ setup-socat-forward.sh всегда возвращает 0")
-print(f"  ✓ Основной скрипт игнорирует предупреждения setup-socat-forward.sh")
+print(f"\n🔧 Ключевые исправления в v6.2.2:")
+print(f"  ✓ ИСПРАВЛЕНО: Принудительное удаление veth-host перед созданием новой пары")
+print(f"  ✓ ИСПРАВЛЕНО: Удаление существующего маршрута перед добавлением нового")
+print(f"  ✓ ИСПРАВЛЕНО: Правильный порядок удаления veth-пары в cleanup_all()")
+print(f"  ✓ ИСПРАВЛЕНО: Добавлены проверки, что veth-пара действительно создана")
+print(f"  ✓ ИСПРАВЛЕНО: Добавлен ip route flush перед ip route add")
 PYEOF
