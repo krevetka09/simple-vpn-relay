@@ -3,15 +3,20 @@ import os
 
 script = r'''#!/usr/bin/env bash
 # ============================================================================
-# XRAY RELAY MANAGER - Production Ready v6.3.1 (Final)
+# XRAY RELAY MANAGER - Production Ready v6.4.0 (Final)
 # Архитектура: Вариант B (Namespace + veth + socat)
-# ИСПРАВЛЕНО v6.3.1: применён патч из аудита (идемпотентный cleanup,
-#                    обратный порядок остановки, жёсткие зависимости socat)
+# ИСПРАВЛЕНО v6.4.0: применены все рекомендации из аудита
+# - Правильный порядок остановки (reverse-stop) через After=/Before=
+# - Idempotent очистка через ExecStop в wg-namespace.service
+# - Restart=on-failure для socat с RestartSec=1
+# - ExecStopPost=/usr/bin/ip link delete для awg-quick
+# - Type=oneshot + RemainAfterExit=yes для wg-namespace
+# - Строгая цепочка зависимостей: wgNS → AWG → Xray/Hysteria → Socat
 # ============================================================================
 
 set -euo pipefail
 
-readonly VERSION="6.3.1"
+readonly VERSION="6.4.0"
 readonly LOG="/var/log/xray-admin.log"
 readonly BACKUP_DIR="/root/.xray-backups"
 readonly CONFIG_DIR="/usr/local/etc/xray"
@@ -24,10 +29,10 @@ readonly VETH_HOST_IP="10.200.0.1"
 readonly VETH_NS_IP="10.200.0.2"
 readonly DIAGNOSTICS_DIR="/root/.xray-diagnostics"
 
-# ИСПРАВЛЕНО v6.3.1: STOP_SERVICES в обратном порядке зависимостей
-# awg-quick@awg0 останавливается первым, т.к. он держит awg0 в основном namespace
-readonly STOP_SERVICES=(awg-quick@awg0 socat-8443 socat-8443 hysteria-server xray wg-namespace)
-readonly ALL_SERVICES=(xray hysteria-server socat-443 socat-8443 wg-namespace)
+# ИСПРАВЛЕНО v6.4.0: STOP_SERVICES в правильном обратном порядке
+# Порядок остановки: socat → hysteria → xray → awg-quick → wg-namespace
+readonly STOP_SERVICES=(socat-8443.service socat-443.service hysteria-server.service xray.service awg-quick@awg0.service wg-namespace.service)
+readonly ALL_SERVICES=(xray.service hysteria-server.service socat-443.service socat-8443.service wg-namespace.service awg-quick@awg0.service)
 readonly ALL_INTERFACES=(awg0 veth-host veth-ns)
 
 RELAY_IP=""
@@ -53,19 +58,20 @@ section() {
 }
 
 # ============================================================================
-# ИСПРАВЛЕНО v6.3.1: Безопасная остановка сервисов в обратном порядке
+# ИСПРАВЛЕНО v6.4.0: Безопасная остановка сервисов в правильном обратном порядке
 # ============================================================================
 
 stop_services_safe() {
     local service
-    log "Остановка сервисов в обратном порядке зависимостей..."
+    log "Остановка сервисов в правильном обратном порядке (reverse-stop)..."
     for service in "${STOP_SERVICES[@]}"; do
         systemctl stop "$service" --quiet 2>/dev/null || true
     done
+    sleep 2
 }
 
 # ============================================================================
-# ИСПРАВЛЕНО v6.3.1: Идемпотентная очистка сети (netns/veth)
+# ИСПРАВЛЕНО v6.4.0: Идемпотентная очистка сети (netns/veth)
 # ============================================================================
 
 cleanup_netns() {
@@ -104,16 +110,15 @@ cleanup_netns() {
 }
 
 # ============================================================================
-# ИСПРАВЛЕНО v6.3.1: Единая функция полной очистки
+# ИСПРАВЛЕНО v6.4.0: Единая функция полной очистки
 # ============================================================================
 
 cleanup_all() {
     log "Полная очистка сервисов и интерфейсов..."
     set +e
     
-    # 1. Остановка сервисов в обратном порядке
+    # 1. Остановка сервисов в правильном обратном порядке
     stop_services_safe
-    sleep 2
     
     # 2. Идемпотентная очистка сети
     cleanup_netns
@@ -148,7 +153,7 @@ collect_diagnostics() {
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "📋 СТАТУС СИСТЕМНЫХ СЕРВИСОВ"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        for service in "${ALL_SERVICES[@]}" awg-quick@awg0; do
+        for service in "${ALL_SERVICES[@]}"; do
             echo -e "\n▶ Сервис: $service"
             systemctl status "$service" --no-pager -l 2>&1 | head -20 || echo "  (не найден)"
         done
@@ -156,7 +161,7 @@ collect_diagnostics() {
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "📜 ПОСЛЕДНИЕ ЛОГИ (30 строк)"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        for service in "${ALL_SERVICES[@]}" awg-quick@awg0; do
+        for service in "${ALL_SERVICES[@]}"; do
             echo -e "\n▶ $service:"
             journalctl -u "$service" -n 30 --no-pager 2>&1 | tail -30 || echo "  (недоступны)"
         done
@@ -282,6 +287,7 @@ create_backup() {
         /etc/systemd/system/hysteria-server.service \
         /etc/systemd/system/socat-443.service \
         /etc/systemd/system/socat-8443.service \
+        /etc/systemd/system/awg-quick@.service \
         /usr/local/bin/setup-awg-namespace.sh \
         /usr/local/bin/setup-socat-forward.sh \
         /usr/local/etc/xray \
@@ -294,13 +300,13 @@ create_backup() {
         die "Установка прервана"
     fi
 
-    # ИСПРАВЛЕНО v6.3.1: rollback-шаблон с теми же функциями
+    # ИСПРАВЛЕНО v6.4.0: rollback-шаблон с правильными функциями
     cat > "$BACKUP_DIR/rollback_$ts.sh" << ROLLBACK_EOF
 #!/bin/bash
 set -e
 echo "Откат к #$ts..."
 
-STOP_SERVICES=(awg-quick@awg0 socat-8443 socat-443 hysteria-server xray wg-namespace)
+STOP_SERVICES=(socat-8443.service socat-443.service hysteria-server.service xray.service awg-quick@awg0.service wg-namespace.service)
 
 stop_services_safe() {
   local service
@@ -840,8 +846,8 @@ fi
 section "Шаг 9: Настройка клиента"
 
 log "Очистка..."
-# ИСПРАВЛЕНО v6.3.1: останавливаем xray и hysteria-server, затем идемпотентно чистим сеть
-systemctl stop xray hysteria-server 2>/dev/null || true
+# ИСПРАВЛЕНО v6.4.0: останавливаем xray и hysteria-server, затем идемпотентно чистим сеть
+systemctl stop xray.service hysteria-server.service 2>/dev/null || true
 cleanup_netns
 
 mkdir -p /etc/amnezia/amneziawg
@@ -861,7 +867,7 @@ ping -c 3 -W 2 10.10.0.1 > /dev/null 2>&1 && log "✓ Пинг до relay" || wa
 
 section "Шаг 10: Создание namespace"
 
-# ИСПРАВЛЕНО v6.3.1: идемпотентное создание namespace
+# ИСПРАВЛЕНО v6.4.0: идемпотентное создание namespace
 if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
     warn "Namespace '$NAMESPACE' уже существует, удаляем..."
     cleanup_netns
@@ -989,17 +995,18 @@ xray -test -config "$CONFIG_DIR/config.json" > /dev/null 2>&1 || die "Конфи
 section "Шаг 13: Установка Hysteria2"
 
 check_hysteria_works() {
-    systemctl is-active --quiet hysteria-server 2>/dev/null && \
+    systemctl is-active --quiet hysteria-server.service 2>/dev/null && \
     ip netns exec xray ss -ulnp 2>/dev/null | grep -q ":8443"
 }
 
 setup_hysteria_service() {
     log "Создание systemd-сервиса Hysteria2..."
+    # ИСПРАВЛЕНО v6.4.0: правильные зависимости After=/Requires=
     cat > /etc/systemd/system/hysteria-server.service << 'HYSTERIA_SVC'
 [Unit]
 Description=Hysteria Server Service (via AmneziaWG relay, in namespace)
-After=network.target wg-namespace.service
-Requires=wg-namespace.service
+Requires=wg-namespace.service awg-quick@awg0.service
+After=wg-namespace.service awg-quick@awg0.service network-online.target
 
 [Service]
 Type=simple
@@ -1019,7 +1026,7 @@ NoNewPrivileges=no
 WantedBy=multi-user.target
 HYSTERIA_SVC
     systemctl daemon-reload
-    systemctl enable hysteria-server > /dev/null 2>&1
+    systemctl enable hysteria-server.service > /dev/null 2>&1
     log "✓ Сервис Hysteria2 создан"
 }
 
@@ -1056,7 +1063,7 @@ masquerade:
 EOF
 
         setup_hysteria_service
-        systemctl restart hysteria-server 2>/dev/null || true
+        systemctl restart hysteria-server.service 2>/dev/null || true
         sleep 2
         check_hysteria_works && log "✓ Hysteria2 работает" || warn "Hysteria2 не запустился"
     else
@@ -1090,14 +1097,14 @@ masquerade:
 EOF
 
         setup_hysteria_service
-        systemctl restart hysteria-server
+        systemctl restart hysteria-server.service
         sleep 2
         check_hysteria_works && log "✓ Hysteria2 установлен" || warn "Hysteria2 не запустился"
     fi
 fi
 
 # ============================================================================
-# ШАГ 14-15: SYSTEMD + VETH + SOCAT (ИСПРАВЛЕНО v6.3.1)
+# ШАГ 14-15: SYSTEMD + VETH + SOCAT (ИСПРАВЛЕНО v6.4.0)
 # ============================================================================
 
 section "Шаг 14: Создание systemd сервисов"
@@ -1113,11 +1120,11 @@ if ip netns list 2>/dev/null | grep -q "^xray" && \
     exit 0
 fi
 
-systemctl stop awg-quick@awg0 2>/dev/null || true
+systemctl stop awg-quick@awg0.service 2>/dev/null || true
 ip link delete awg0 2>/dev/null || true
 ip netns delete xray 2>/dev/null || rm -f /run/netns/xray || true
 
-systemctl start awg-quick@awg0
+systemctl start awg-quick@awg0.service
 sleep 3
 
 ip netns add xray
@@ -1139,33 +1146,52 @@ echo "Namespace xray настроен"
 NSEOF
 chmod +x /usr/local/bin/setup-awg-namespace.sh
 
+# ИСПРАВЛЕНО v6.4.0: Type=oneshot + RemainAfterExit=yes + ExecStop для идемпотентной очистки
 cat > /etc/systemd/system/wg-namespace.service << 'SVCEOF'
 [Unit]
 Description=Setup AmneziaWG namespace
-Before=xray.service hysteria-server.service
-After=network.target awg-quick@awg0.service
-Wants=awg-quick@awg0.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/setup-awg-namespace.sh
+ExecStop=/usr/bin/ip netns delete xray
 RemainAfterExit=yes
+TimeoutStartSec=10
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-cat > /etc/systemd/system/xray.service << EOF
+# ИСПРАВЛЕНО v6.4.0: awg-quick@.service с ExecStopPost для удаления интерфейса
+cat > /etc/systemd/system/awg-quick@.service << 'AWGSVCEOF'
 [Unit]
-Description=Xray Service (via AmneziaWG relay, in namespace)
-After=network.target wg-namespace.service
+Description=AWG interface %i via wg-quick(8)
+After=wg-namespace.service
 Requires=wg-namespace.service
-Before=socat-443.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/awg-quick up %i
+ExecStopPost=/usr/bin/ip link delete %i
+KillMode=process
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+AWGSVCEOF
+
+# ИСПРАВЛЕНО v6.4.0: xray.service с правильными зависимостями
+cat > /etc/systemd/system/xray.service << 'EOF'
+[Unit]
+Description=Xray Service (via AmneziaWG namespace)
+Requires=wg-namespace.service awg-quick@awg0.service
+After=wg-namespace.service awg-quick@awg0.service network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/sbin/ip netns exec xray /usr/local/xray/xray run -config $CONFIG_DIR/config.json
+ExecStart=/sbin/ip netns exec xray /usr/local/xray/xray run -config /usr/local/etc/xray/config.json
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -1174,12 +1200,12 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
+# ИСПРАВЛЕНО v6.4.0: hysteria-server.service с правильными зависимостями
 cat > /etc/systemd/system/hysteria-server.service << 'HYSTERIA_SVC'
 [Unit]
 Description=Hysteria Server Service (via AmneziaWG relay, in namespace)
-After=network.target wg-namespace.service
-Requires=wg-namespace.service
-Before=socat-8443.service
+Requires=wg-namespace.service awg-quick@awg0.service
+After=wg-namespace.service awg-quick@awg0.service network-online.target
 
 [Service]
 Type=simple
@@ -1200,10 +1226,10 @@ WantedBy=multi-user.target
 HYSTERIA_SVC
 
 systemctl daemon-reload
-systemctl enable wg-namespace.service xray.service hysteria-server.service > /dev/null 2>&1
-log "✓ Сервисы созданы (линейная цепочка: wg-namespace → xray → socat)"
+systemctl enable wg-namespace.service awg-quick@awg0.service xray.service hysteria-server.service > /dev/null 2>&1
+log "✓ Сервисы созданы (строгая цепочка зависимостей)"
 
-section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.3.1)"
+section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.4.0)"
 
 cat > /usr/local/bin/setup-socat-forward.sh << SOCAT_EOF
 #!/usr/bin/env bash
@@ -1216,7 +1242,7 @@ ip netns list 2>/dev/null | grep -q "^\$NAMESPACE" || { echo "ERROR: Namespace �
 
 echo "Принудительное удаление существующих veth-интерфейсов..."
 
-# ИСПРАВЛЕНО v6.3.1: Guard-ы для идемпотентности
+# ИСПРАВЛЕНО v6.4.0: Guard-ы для идемпотентности
 if ip link show veth-host >/dev/null 2>&1; then
     ip link delete veth-host 2>/dev/null || true
     sleep 1
@@ -1295,37 +1321,39 @@ exit 0
 SOCAT_EOF
 chmod +x /usr/local/bin/setup-socat-forward.sh
 
-# ИСПРАВЛЕНО v6.3.1: Жёсткие зависимости After=/Requires= для socat
-# socat должен стартовать ПОСЛЕ всех внутренних сервисов (xray, hysteria)
+# ИСПРАВЛЕНО v6.4.0: socat-443.service с правильными зависимостями и Restart=on-failure
 cat > /etc/systemd/system/socat-443.service << 'EOF'
 [Unit]
 Description=Socat Port 443 Forwarding to Xray Namespace
-After=network-online.target wg-namespace.service xray.service hysteria-server.service
-Requires=wg-namespace.service xray.service hysteria-server.service
+Requires=xray.service
+After=xray.service
 
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/sh -c 'ss -tulpn | grep -q ":443 " && exit 1 || exit 0'
 ExecStart=/usr/bin/socat TCP-LISTEN:443,bind=0.0.0.0,fork,reuseaddr TCP:10.200.0.2:443
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# ИСПРАВЛЕНО v6.4.0: socat-8443.service с правильными зависимостями и Restart=on-failure
 cat > /etc/systemd/system/socat-8443.service << 'EOF'
 [Unit]
 Description=Socat Port 8443 Forwarding to Hysteria Namespace
-After=network-online.target wg-namespace.service xray.service hysteria-server.service
-Requires=wg-namespace.service xray.service hysteria-server.service
+Requires=hysteria-server.service
+After=hysteria-server.service
 
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/sh -c 'ss -ulpn | grep -q ":8443 " && exit 1 || exit 0'
 ExecStart=/usr/bin/socat UDP-LISTEN:8443,bind=0.0.0.0,fork,reuseaddr UDP:10.200.0.2:8443
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=1
 
 [Install]
 WantedBy=multi-user.target
@@ -1333,15 +1361,15 @@ EOF
 
 systemctl daemon-reload
 systemctl enable socat-443.service socat-8443.service > /dev/null 2>&1
-log "✓ Socat сервисы (жёсткие зависимости, ExecStartPre=sleep 5)"
+log "✓ Socat сервисы (жёсткие зависимости, Restart=on-failure, RestartSec=1)"
 
 # ============================================================================
-# ШАГ 16-17: ЗАПУСК + SMOKE ТЕСТЫ (ИСПРАВЛЕНО v6.3.1)
+# ШАГ 16-17: ЗАПУСК + SMOKE ТЕСТЫ (ИСПРАВЛЕНО v6.4.0)
 # ============================================================================
 
-section "Шаг 16: Запуск всех сервисов (ИСПРАВЛЕНО v6.3.1)"
+section "Шаг 16: Запуск всех сервисов (ИСПРАВЛЕНО v6.4.0)"
 
-# ИСПРАВЛЕНО v6.3.1: Единая функция cleanup_all (вызывается один раз)
+# ИСПРАВЛЕНО v6.4.0: Единая функция cleanup_all (вызывается один раз)
 cleanup_all
 
 if ! check_namespace_health; then
@@ -1357,9 +1385,18 @@ log "Создание veth-пары..."
     die "Не удалось создать veth-пару"
 }
 
+# ИСПРАВЛЕНО v6.4.0: Строгий порядок запуска согласно зависимостям
+log "Запуск wg-namespace.service..."
+systemctl start wg-namespace.service
+sleep 2
+
+log "Запуск awg-quick@awg0.service..."
+systemctl start awg-quick@awg0.service
+sleep 2
+
 log "Запуск Xray..."
-systemctl start xray
-wait_for_service xray 30 || die "Xray не запустился"
+systemctl start xray.service
+wait_for_service xray.service 30 || die "Xray не запустился"
 
 log "Проверка порта 443 в namespace..."
 for i in {1..10}; do
@@ -1372,25 +1409,37 @@ for i in {1..10}; do
 done
 
 log "Запуск Hysteria2..."
-systemctl start hysteria-server
-wait_for_service hysteria-server 30 || warn "Hysteria2 не запустился"
+systemctl start hysteria-server.service
+wait_for_service hysteria-server.service 30 || warn "Hysteria2 не запустился"
 
 log "Ожидание готовности сервисов (5s)..."
 sleep 5
 
-# ИСПРАВЛЕНО v6.3.1: Проверка занятости порта перед запуском socat
+# ИСПРАВЛЕНО v6.4.0: Проверка готовности через ss внутри namespace перед стартом socat
+log "Проверка готовности Xray в namespace..."
+if ! ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
+    error "Xray не слушает порт 443 в namespace"
+    die "Xray не готов"
+fi
+
+log "Проверка готовности Hysteria2 в namespace..."
+if ! ip netns exec xray ss -ulnp 2>/dev/null | grep -q ":8443"; then
+    warn "Hysteria2 не слушает порт 8443 в namespace"
+fi
+
+# ИСПРАВЛЕНО v6.4.0: Проверка занятости порта перед запуском socat
 log "Проверка занятости порта 443..."
-if ss -tlnp | grep -q ":443"; then
+if ss -tulpn | grep -q ":443 "; then
     error "Порт 443 уже занят другим процессом:"
-    ss -tlnp | grep :443
+    ss -tulpn | grep ":443 "
     error "Остановите конфликтующий сервис и повторите установку"
     die "Порт 443 занят"
 fi
 
 log "Проверка занятости порта 8443..."
-if ss -ulnp | grep -q ":8443"; then
+if ss -ulpn | grep -q ":8443 "; then
     error "Порт 8443 уже занят другим процессом:"
-    ss -ulnp | grep :8443
+    ss -ulpn | grep ":8443 "
     error "Остановите конфликтующий сервис и повторите установку"
     die "Порт 8443 занят"
 fi
@@ -1417,8 +1466,8 @@ ss -tlnp | grep -q ":443.*socat" || {
 wait_for_port 443 tcp 30 || die "Порт 443/tcp не готов"
 wait_for_port 8443 udp 30 || warn "Порт 8443/udp не готов"
 
-systemctl is-active --quiet xray && log "✓ Xray запущен" || warn "Xray не запущен"
-systemctl is-active --quiet hysteria-server && log "✓ Hysteria2 запущен" || warn "Hysteria2 не запущен"
+systemctl is-active --quiet xray.service && log "✓ Xray запущен" || warn "Xray не запущен"
+systemctl is-active --quiet hysteria-server.service && log "✓ Hysteria2 запущен" || warn "Hysteria2 не запущен"
 systemctl is-active --quiet socat-443.service && systemctl is-active --quiet socat-8443.service && \
     log "✓ Socat запущен" || warn "Socat не запущен"
 
@@ -1485,7 +1534,7 @@ else
 fi
 
 # ============================================================================
-# ШАГ 18: XRAY-ADMIN (ИСПРАВЛЕНО v6.3.1)
+# ШАГ 18: XRAY-ADMIN (ИСПРАВЛЕНО v6.4.0)
 # ============================================================================
 
 section "Шаг 18: Управляющий скрипт"
@@ -1519,10 +1568,10 @@ get_relay_ip() {
 
 get_public_ip() { ip netns exec $NAMESPACE curl -s4 --max-time 5 ifconfig.me 2>/dev/null || echo "N/A"; }
 
-# ИСПРАВЛЕНО v6.3.1: те же функции, что и в основном скрипте
+# ИСПРАВЛЕНО v6.4.0: те же функции, что и в основном скрипте
 stop_services_safe() {
     local service
-    local STOP_SERVICES=(awg-quick@awg0 socat-8443 socat-443 hysteria-server xray wg-namespace)
+    local STOP_SERVICES=(socat-8443.service socat-443.service hysteria-server.service xray.service awg-quick@awg0.service wg-namespace.service)
     for service in "${STOP_SERVICES[@]}"; do
         systemctl stop "$service" --quiet 2>/dev/null || true
     done
@@ -1548,9 +1597,9 @@ cmd_status() {
     local relay_ip
     relay_ip=$(get_relay_ip)
     printf "%-25s %s\n" "Relay (РФ):" "$(ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no -o LogLevel=ERROR -q root@"$relay_ip" 'systemctl is-active amneziawg@awg0' 2>/dev/null || echo 'unreachable')"
-    printf "%-25s %s\n" "Client (AWG):" "$(systemctl is-active awg-quick@awg0 2>/dev/null || echo 'inactive')"
-    printf "%-25s %s\n" "Xray:" "$(systemctl is-active xray 2>/dev/null || echo 'inactive')"
-    printf "%-25s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server 2>/dev/null || echo 'inactive')"
+    printf "%-25s %s\n" "Client (AWG):" "$(systemctl is-active awg-quick@awg0.service 2>/dev/null || echo 'inactive')"
+    printf "%-25s %s\n" "Xray:" "$(systemctl is-active xray.service 2>/dev/null || echo 'inactive')"
+    printf "%-25s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server.service 2>/dev/null || echo 'inactive')"
     printf "%-25s %s\n" "Socat-443:" "$(systemctl is-active socat-443.service 2>/dev/null || echo 'inactive')"
     printf "%-25s %s\n" "Socat-8443:" "$(systemctl is-active socat-8443.service 2>/dev/null || echo 'inactive')"
     printf "%-25s %s\n" "Namespace:" "$(ip netns list 2>/dev/null | grep -c $NAMESPACE || echo '0')/1"
@@ -1611,7 +1660,7 @@ cmd_remove_client() {
     tmp=$(mktemp)
     jq "del(.clients[] | select(.name==\"$name\"))" "$CLIENTS" > "$tmp" && mv "$tmp" "$CLIENTS"
     echo -e "${GREEN}✓ Удалён: $name${NC}"
-    systemctl restart xray
+    systemctl restart xray.service
 }
 
 cmd_rename_client() {
@@ -1659,7 +1708,7 @@ cmd_gen_links() {
 cmd_restart() {
     log_action "restart"
     echo "Перезапуск..."
-    # ИСПРАВЛЕНО v6.3.1: используем те же функции
+    # ИСПРАВЛЕНО v6.4.0: используем те же функции
     stop_services_safe
     sleep 2
     cleanup_netns
@@ -1668,7 +1717,13 @@ cmd_restart() {
     # Запуск в правильном порядке
     /usr/local/bin/setup-awg-namespace.sh
     /usr/local/bin/setup-socat-forward.sh || true
-    systemctl start xray.service hysteria-server.service socat-443.service socat-8443.service 2>/dev/null || true
+    systemctl start wg-namespace.service
+    sleep 2
+    systemctl start awg-quick@awg0.service
+    sleep 2
+    systemctl start xray.service hysteria-server.service
+    sleep 2
+    systemctl start socat-443.service socat-8443.service
     sleep 3
     cmd_status
 }
@@ -1678,8 +1733,8 @@ cmd_monitor() {
     echo "Мониторинг... (Ctrl+C для остановки)"
     while true; do
         local xray_st awg_st socat443_st socat8443_st ip
-        xray_st=$(systemctl is-active xray 2>/dev/null || echo "inactive")
-        awg_st=$(systemctl is-active awg-quick@awg0 2>/dev/null || echo "inactive")
+        xray_st=$(systemctl is-active xray.service 2>/dev/null || echo "inactive")
+        awg_st=$(systemctl is-active awg-quick@awg0.service 2>/dev/null || echo "inactive")
         socat443_st=$(systemctl is-active socat-443.service 2>/dev/null || echo "inactive")
         socat8443_st=$(systemctl is-active socat-8443.service 2>/dev/null || echo "inactive")
         ip=$(get_public_ip)
@@ -1687,7 +1742,7 @@ cmd_monitor() {
 
         [[ "$xray_st" != "active" ]] && {
             echo -e "${RED}Xray упал!${NC}"
-            /usr/local/bin/setup-awg-namespace.sh && systemctl restart xray
+            /usr/local/bin/setup-awg-namespace.sh && systemctl restart xray.service
             send_alert "🚨 Xray перезапущен на $(hostname)"
         }
         [[ "$socat443_st" != "active" ]] && {
@@ -1784,19 +1839,19 @@ cmd_update() {
     read -p "Обновить? (y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
 
-    systemctl stop xray
+    systemctl stop xray.service
     cd /tmp
     wget -q -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${latest}/Xray-linux-64.zip"
     unzip -o -q /tmp/xray.zip -d /usr/local/xray
     rm -f /tmp/xray.zip
     chmod +x /usr/local/xray/xray
-    systemctl start xray
+    systemctl start xray.service
 
     echo -e "${GREEN}✓ Xray обновлён до $latest${NC}"
 }
 
 cmd_version() {
-    echo "xray-admin v6.3.1"
+    echo "xray-admin v6.4.0"
     echo "VPN Relay Manager (Namespace + veth + socat)"
     echo ""
     echo "Компоненты:"
@@ -1818,7 +1873,7 @@ cmd_version() {
 }
 
 cmd_help() {
-    echo -e "${CYAN}xray-admin v6.3.1 - VPN Relay Manager${NC}"
+    echo -e "${CYAN}xray-admin v6.4.0 - VPN Relay Manager${NC}"
     echo ""
     echo "Команды:"
     echo "  status              - Статус сервисов"
@@ -1866,7 +1921,7 @@ log "✓ Управляющий скрипт: $ADMIN_BIN"
 section "✅ Установка завершена!"
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  VPN Relay v6.3.1 (Namespace + veth + socat)       ║${NC}"
+echo -e "${GREEN}║  VPN Relay v6.4.0 (Namespace + veth + socat)       ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -1889,9 +1944,9 @@ echo ""
 
 echo -e "${YELLOW}Статус:${NC}"
 printf "  %-30s %s\n" "AmneziaWG (relay):" "$(relay_ssh 'systemctl is-active amneziawg@awg0' 2>/dev/null || echo 'inactive')"
-printf "  %-30s %s\n" "AmneziaWG (client):" "$(systemctl is-active awg-quick@awg0 2>/dev/null || echo 'inactive')"
-printf "  %-30s %s\n" "Xray:" "$(systemctl is-active xray 2>/dev/null || echo 'inactive')"
-printf "  %-30s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "AmneziaWG (client):" "$(systemctl is-active awg-quick@awg0.service 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Xray:" "$(systemctl is-active xray.service 2>/dev/null || echo 'inactive')"
+printf "  %-30s %s\n" "Hysteria2:" "$(systemctl is-active hysteria-server.service 2>/dev/null || echo 'inactive')"
 printf "  %-30s %s\n" "Socat-443:" "$(systemctl is-active socat-443.service 2>/dev/null || echo 'inactive')"
 printf "  %-30s %s\n" "Socat-8443:" "$(systemctl is-active socat-8443.service 2>/dev/null || echo 'inactive')"
 echo ""
@@ -1944,17 +1999,16 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Скрипт v6.3.1 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Скрипт v6.4.0 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
-print(f"\n🔧 Ключевые исправления в v6.3.1:")
-print(f"  ✓ STOP_SERVICES в обратном порядке зависимостей")
-print(f"  ✓ stop_services_safe() - безопасная остановка")
-print(f"  ✓ cleanup_netns() - идемпотентная очистка сети")
-print(f"  ✓ cleanup_all() использует новые функции")
-print(f"  ✓ rollback-шаблон с теми же функциями")
-print(f"  ✓ Шаг 9: stop xray/hysteria + cleanup_netns")
-print(f"  ✓ Шаг 10: идемпотентное создание namespace")
-print(f"  ✓ Socat: жёсткие After=/Requires= зависимости")
-print(f"  ✓ xray-admin использует те же функции")
+print(f"\n🔧 Ключевые исправления в v6.4.0 (согласно аудиту):")
+print(f"  ✓ Правильный порядок остановки (reverse-stop) через After=/Before=")
+print(f"  ✓ Idempotent очистка через ExecStop в wg-namespace.service")
+print(f"  ✓ Restart=on-failure для socat с RestartSec=1")
+print(f"  ✓ ExecStopPost=/usr/bin/ip link delete для awg-quick")
+print(f"  ✓ Type=oneshot + RemainAfterExit=yes для wg-namespace")
+print(f"  ✓ Строгая цепочка зависимостей: wgNS → AWG → Xray/Hysteria → Socat")
+print(f"  ✓ Проверка готовности через ss внутри namespace перед стартом socat")
+print(f"  ✓ ExecStartPre для проверки занятости портов через ss -tulpn")
 PYEOF
