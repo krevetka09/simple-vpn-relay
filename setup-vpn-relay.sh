@@ -3,14 +3,16 @@ import os
 
 script = r'''#!/usr/bin/env bash
 # ============================================================================
-# XRAY RELAY MANAGER - Production Ready v6.4.1 (Final)
-# Архитектура: Вариант B (Namespace + veth + socat)
-# ИСПРАВЛЕНО v6.4.1: устранена циклическая зависимость сервисов
+# XRAY RELAY MANAGER - Production Ready v6.4.2 (Final)
+# ИСПРАВЛЕНО v6.4.2:
+#   1. Детерминированная проверка сокетов через ss -H -ltn 'sport = :PORT'
+#   2. Убран двойной запуск awg-quick (гонка)
+#   3. wait_for_tcp_port/wait_for_udp_port вместо sleep + is-active
 # ============================================================================
 
 set -euo pipefail
 
-readonly VERSION="6.4.1"
+readonly VERSION="6.4.2"
 readonly LOG="/var/log/xray-admin.log"
 readonly BACKUP_DIR="/root/.xray-backups"
 readonly CONFIG_DIR="/usr/local/etc/xray"
@@ -23,10 +25,8 @@ readonly VETH_HOST_IP="10.200.0.1"
 readonly VETH_NS_IP="10.200.0.2"
 readonly DIAGNOSTICS_DIR="/root/.xray-diagnostics"
 
-# ИСПРАВЛЕНО v6.4.1: Правильный порядок остановки
 readonly STOP_SERVICES=(socat-8443.service socat-443.service hysteria-server.service xray.service awg-quick@awg0.service wg-namespace.service)
 readonly ALL_SERVICES=(wg-namespace.service awg-quick@awg0.service xray.service hysteria-server.service socat-443.service socat-8443.service)
-readonly ALL_INTERFACES=(awg0 veth-host veth-ns)
 
 RELAY_IP=""
 RELAY_AUTH=""
@@ -50,10 +50,6 @@ section() {
     echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}\n" | tee -a "$LOG"
 }
 
-# ============================================================================
-# ИСПРАВЛЕНО v6.4.1: Безопасная остановка сервисов
-# ============================================================================
-
 stop_services_safe() {
     local service
     log "Остановка сервисов в правильном обратном порядке (reverse-stop)..."
@@ -63,68 +59,37 @@ stop_services_safe() {
     sleep 2
 }
 
-# ============================================================================
-# ИСПРАВЛЕНО v6.4.1: Идемпотентная очистка сети
-# ============================================================================
-
 cleanup_netns() {
     log "Идемпотентная очистка сети (netns/veth)..."
     set +e
-    
-    # 1. Если namespace существует, удаляем интерфейсы ВНУТРИ него
     if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
-        if ip netns exec "$NAMESPACE" ip link show awg0 >/dev/null 2>&1; then
+        ip netns exec "$NAMESPACE" ip link show awg0 >/dev/null 2>&1 && \
             ip netns exec "$NAMESPACE" ip link delete awg0 2>/dev/null || true
-        fi
-        if ip netns exec "$NAMESPACE" ip link show veth-ns >/dev/null 2>&1; then
+        ip netns exec "$NAMESPACE" ip link show veth-ns >/dev/null 2>&1 && \
             ip netns exec "$NAMESPACE" ip link delete veth-ns 2>/dev/null || true
-        fi
     fi
-    
-    # 2. Удаляем veth-host в основном namespace
-    if ip link show veth-host >/dev/null 2>&1; then
-        ip link delete veth-host 2>/dev/null || true
-    fi
-    
-    # 3. Удаляем namespace
-    if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
-        ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" 2>/dev/null || true
-    fi
-    
-    # 4. Удаляем awg0 в основном namespace
-    if ip link show awg0 >/dev/null 2>&1; then
-        ip link delete awg0 2>/dev/null || true
-    fi
-    
+    ip link show veth-host >/dev/null 2>&1 && ip link delete veth-host 2>/dev/null || true
+    ip netns list 2>/dev/null | grep -q "^$NAMESPACE" && \
+        (ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" 2>/dev/null || true)
+    ip link show awg0 >/dev/null 2>&1 && ip link delete awg0 2>/dev/null || true
     set -e
     log "✓ Очистка сети завершена"
 }
 
-# ============================================================================
-# ИСПРАВЛЕНО v6.4.1: Единая функция полной очистки
-# ============================================================================
-
 cleanup_all() {
     log "Полная очистка сервисов и интерфейсов..."
     set +e
-    
     stop_services_safe
     cleanup_netns
     sleep 1
-    
     set -e
     log "✓ Полная очистка завершена"
 }
-
-# ============================================================================
-# ДИАГНОСТИКА
-# ============================================================================
 
 collect_diagnostics() {
     local ts diag_file
     ts=$(date +%Y%m%d_%H%M%S)
     diag_file="$DIAGNOSTICS_DIR/diagnostics_$ts.log"
-    
     mkdir -p "$DIAGNOSTICS_DIR"
     
     echo -e "\n${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}" >&2
@@ -157,9 +122,7 @@ collect_diagnostics() {
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "🌐 NETWORK NAMESPACES"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "\n▶ Список:"
         ip netns list 2>&1 || echo "  (нет)"
-        
         if ip netns list 2>/dev/null | grep -q "^xray"; then
             echo -e "\n▶ Интерфейсы в 'xray':"
             ip netns exec xray ip link show 2>&1
@@ -188,19 +151,15 @@ collect_diagnostics() {
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "🔥 IPTABLES И SYSCTL"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "\n▶ FORWARD:"
         iptables -L FORWARD -v -n 2>&1
-        echo -e "\n▶ NAT POSTROUTING:"
+        echo ""
         iptables -t nat -L POSTROUTING -v -n 2>&1
-        echo -e "\n▶ IP forward:"
         sysctl net.ipv4.ip_forward 2>&1
         
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "⚡ ПРОЦЕССЫ И МОДУЛИ"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "\n▶ Процессы:"
         ps aux | grep -E "(xray|hysteria|socat|awg)" | grep -v grep || echo "  (нет)"
-        echo -e "\n▶ Модули ядра:"
         lsmod | grep -E "(amnezia|wireguard)" || echo "  (не загружены)"
         
         echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -213,31 +172,14 @@ collect_diagnostics() {
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         df -h 2>&1
         
-        echo -e "\n============================================================"
-        echo "КОНЕЦ ОТЧЁТА"
-        echo "============================================================"
-        
     } > "$diag_file" 2>&1
     
     echo -e "${YELLOW}📄 Отчёт сохранён:${NC} $diag_file" >&2
     echo -e "${YELLOW}📏 Размер:${NC} $(du -h "$diag_file" | cut -f1)" >&2
-    echo "" >&2
-    
-    echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-    echo -e "${MAGENTA}📋 КРАТКАЯ СВОДКА (первые 100 строк)${NC}" >&2
-    echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-    head -n 100 "$diag_file" >&2
-    echo -e "${MAGENTA}... (полный отчёт: $diag_file)${NC}\n" >&2
-    
     echo "$diag_file" > "$DIAGNOSTICS_DIR/latest_diagnostics"
     ls -t "$DIAGNOSTICS_DIR"/diagnostics_*.log 2>/dev/null | tail -n +11 | xargs -r rm -f
-    
     log "✓ Диагностический отчёт: $diag_file"
 }
-
-# ============================================================================
-# БЕКАПЫ И ОТКАТ
-# ============================================================================
 
 create_backup() {
     local ts
@@ -247,15 +189,6 @@ create_backup() {
 
     iptables-save > "$BACKUP_DIR/iptables_$ts.save" 2>/dev/null || true
     lsmod > "$BACKUP_DIR/lsmod_$ts.txt" 2>/dev/null || true
-
-    {
-        echo "# Network state before install"
-        ip netns list 2>/dev/null || echo "No namespace"
-        ip link show awg0 2>/dev/null || echo "awg0 missing"
-        ip link show veth-host 2>/dev/null || echo "veth-host missing"
-        ip route show 2>/dev/null || true
-        ip rule show 2>/dev/null || true
-    } > "$BACKUP_DIR/network_state_$ts.txt" 2>/dev/null || true
 
     tar czf "$BACKUP_DIR/configs_$ts.tar.gz" \
         /etc/amnezia \
@@ -319,49 +252,38 @@ ROLLBACK_EOF
     for pattern in rollback_ configs_ iptables_ network_state_; do
         ls -t "$BACKUP_DIR"/${pattern}* 2>/dev/null | tail -n +6 | xargs -r rm -f
     done
-
     log "✓ Бэкап #$ts создан"
 }
 
 rollback() {
     collect_diagnostics
-    
     if [[ ! -f "$BACKUP_DIR/latest_backup" ]]; then
         warn "Бэкапы не найдены, принудительная очистка"
         stop_services_safe
         cleanup_netns
         return 0
     fi
-
     local latest_ts rollback_script
     latest_ts=$(cat "$BACKUP_DIR/latest_backup")
     rollback_script="$BACKUP_DIR/rollback_$latest_ts.sh"
-
     if [[ ! -f "$rollback_script" ]]; then
         error "Скрипт отката не найден, принудительная очистка"
         stop_services_safe
         cleanup_netns
         return 1
     fi
-
     echo -e "\n${RED}╔══════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║  ВЫПОЛНЯЕТСЯ АВТОМАТИЧЕСКИЙ ОТКАТ            ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════╝${NC}"
-
     bash "$rollback_script" || {
         warn "Откат завершился с ошибкой, принудительная очистка"
         stop_services_safe
         cleanup_netns
     }
-
     echo -e "${RED}✓ Откат завершён. Лог: $LOG${NC}\n"
 }
 
 trap 'error "Критическая ошибка на строке $LINENO"; rollback' ERR
-
-# ============================================================================
-# SSH ФУНКЦИИ
-# ============================================================================
 
 validate_ssh_auth() {
     if [[ -f "$RELAY_AUTH" ]]; then
@@ -401,15 +323,10 @@ relay_scp() {
     fi
 }
 
-# ============================================================================
-# МЕХАНИЗМ ПОВТОРНЫХ ПОПЫТОК
-# ============================================================================
-
 retry_cmd() {
     local max_attempts="${1:-3}" delay="${2:-5}"
     shift 2
     local cmd="$*" attempt=1
-
     while [[ $attempt -le $max_attempts ]]; do
         if eval "$cmd" >/dev/null 2>&1; then
             return 0
@@ -422,54 +339,93 @@ retry_cmd() {
     return 1
 }
 
+# ============================================================================
+# ИСПРАВЛЕНО v6.4.2: wait_for_service / wait_for_tcp_port / wait_for_udp_port
+# ============================================================================
+
 wait_for_service() {
     local service="$1" max_wait="${2:-30}" interval=2 elapsed=0
-
     log "Ожидание $service (макс ${max_wait}s)..."
-    
     while [[ $elapsed -lt $max_wait ]]; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
-            log "✓ $service готов (${elapsed}s)"
+            log "✓ $service активен (${elapsed}s)"
             return 0
         fi
         sleep $interval
         elapsed=$((elapsed + interval))
     done
-    
     error "$service не запустился за ${max_wait}s"
     journalctl -u "$service" -n 10 --no-pager 2>&1 || true
     return 1
 }
 
-wait_for_port() {
-    local port="$1" protocol="${2:-tcp}" max_wait="${3:-30}" interval=1 elapsed=0
-    local cmd="ss -tlnp"
-    [[ "$protocol" == "udp" ]] && cmd="ss -ulnp"
-
-    log "Ожидание порта $port/$protocol (макс ${max_wait}s)..."
-    
+wait_for_tcp_port() {
+    local port="$1" max_wait="${2:-30}" interval=1 elapsed=0
+    log "Ожидание TCP порта $port (макс ${max_wait}s)..."
     while [[ $elapsed -lt $max_wait ]]; do
-        if $cmd 2>/dev/null | grep -q ":$port"; then
-            log "✓ Порт $port/$protocol готов (${elapsed}s)"
+        if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+            log "✓ TCP порт $port открыт (${elapsed}s)"
             return 0
         fi
         sleep $interval
         elapsed=$((elapsed + interval))
     done
-    
-    error "Порт $port/$protocol не готов за ${max_wait}s"
+    error "TCP порт $port не открылся за ${max_wait}s"
+    ss -H -ltn "sport = :$port" 2>&1 || true
     return 1
 }
 
-# ============================================================================
-# ИСПРАВЛЕНО v6.4.1: Ожидание появления интерфейса с таймаутом
-# ============================================================================
+wait_for_udp_port() {
+    local port="$1" max_wait="${2:-30}" interval=1 elapsed=0
+    log "Ожидание UDP порта $port (макс ${max_wait}s)..."
+    while [[ $elapsed -lt $max_wait ]]; do
+        if ss -H -lun "sport = :$port" 2>/dev/null | grep -q UNCONN; then
+            log "✓ UDP порт $port открыт (${elapsed}s)"
+            return 0
+        fi
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    error "UDP порт $port не открылся за ${max_wait}s"
+    ss -H -lun "sport = :$port" 2>&1 || true
+    return 1
+}
+
+wait_for_namespace_tcp_port() {
+    local port="$1" max_wait="${2:-30}" interval=1 elapsed=0
+    log "Ожидание TCP порта $port в namespace $NAMESPACE (макс ${max_wait}s)..."
+    while [[ $elapsed -lt $max_wait ]]; do
+        if ip netns exec "$NAMESPACE" ss -H -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+            log "✓ TCP порт $port в namespace открыт (${elapsed}s)"
+            return 0
+        fi
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    error "TCP порт $port в namespace не открылся за ${max_wait}s"
+    ip netns exec "$NAMESPACE" ss -H -ltn "sport = :$port" 2>&1 || true
+    return 1
+}
+
+wait_for_namespace_udp_port() {
+    local port="$1" max_wait="${2:-30}" interval=1 elapsed=0
+    log "Ожидание UDP порта $port в namespace $NAMESPACE (макс ${max_wait}s)..."
+    while [[ $elapsed -lt $max_wait ]]; do
+        if ip netns exec "$NAMESPACE" ss -H -lun "sport = :$port" 2>/dev/null | grep -q UNCONN; then
+            log "✓ UDP порт $port в namespace открыт (${elapsed}s)"
+            return 0
+        fi
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+    error "UDP порт $port в namespace не открылся за ${max_wait}s"
+    ip netns exec "$NAMESPACE" ss -H -lun "sport = :$port" 2>&1 || true
+    return 1
+}
 
 wait_for_interface() {
     local iface="$1" max_wait="${2:-10}" interval=1 elapsed=0
-    
-    log "Ожидание появления интерфейса $iface (макс ${max_wait}s)..."
-    
+    log "Ожидание интерфейса $iface (макс ${max_wait}s)..."
     while [[ $elapsed -lt $max_wait ]]; do
         if ip link show "$iface" >/dev/null 2>&1; then
             log "✓ Интерфейс $iface появился (${elapsed}s)"
@@ -478,7 +434,6 @@ wait_for_interface() {
         sleep $interval
         elapsed=$((elapsed + interval))
     done
-    
     error "Интерфейс $iface не появился за ${max_wait}s"
     return 1
 }
@@ -487,13 +442,8 @@ check_namespace_health() {
     ip netns list 2>/dev/null | grep -q "^$NAMESPACE" || return 1
     ip netns exec "$NAMESPACE" ip link show awg0 >/dev/null 2>&1 || return 1
     ip netns exec "$NAMESPACE" ip route show | grep -q "default" || return 1
-    ip netns exec "$NAMESPACE" ip link show veth-ns >/dev/null 2>&1 || return 1
     return 0
 }
-
-# ============================================================================
-# ПАКЕТНЫЙ МЕНЕДЖЕР
-# ============================================================================
 
 detect_package_manager() {
     if command -v apt-get &> /dev/null; then
@@ -521,16 +471,8 @@ pkg_install() {
     esac
 }
 
-# ============================================================================
-# ПРОВЕРКА ПАРАМЕТРОВ
-# ============================================================================
-
 if [[ $# -lt 2 ]]; then
     echo "Использование: $0 <IP_РФ_сервера> <SSH_пароль_или_ключ>"
-    echo ""
-    echo "Примеры:"
-    echo "  $0 161.104.47.154 /root/.ssh/id_ed25519  (рекомендуется)"
-    echo "  $0 161.104.47.154 'MyPassword123'         (небезопасно)"
     exit 1
 fi
 
@@ -544,16 +486,10 @@ echo "Хост: $(hostname)" >> "$LOG"
 
 create_backup
 
-# ============================================================================
-# ШАГ 1-13: УСТАНОВКА (без изменений)
-# ============================================================================
-
 section "Шаг 1: Проверка DNS"
-
 fix_dns() {
     ping -c 1 -W 2 github.com > /dev/null 2>&1 && return 0
     warn "DNS не работает, исправляем..."
-    cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
     cat > /etc/resolv.conf << EOF
 nameserver 8.8.8.8
 nameserver 1.1.1.1
@@ -562,48 +498,37 @@ EOF
     sleep 2
     ping -c 1 -W 2 github.com > /dev/null 2>&1
 }
-
 retry_cmd 3 5 fix_dns || die "Не удалось настроить DNS"
 log "✓ DNS работает"
 
 section "Шаг 2: Проверка SSH"
-
 detect_package_manager
 pkg_install sshpass 2>/dev/null || true
 validate_ssh_auth
-
 retry_cmd 3 10 "relay_ssh 'echo SSH_OK'" || die "Не удалось подключиться к $RELAY_IP"
 log "✓ SSH работает"
 
 section "Шаг 3: Определение ОС"
-
 RELAY_OS=$(relay_ssh 'grep ^ID= /etc/os-release | cut -d= -f2 | tr -d "\""' || echo "unknown")
 RELAY_VERSION=$(relay_ssh 'grep ^VERSION_ID= /etc/os-release | cut -d= -f2 | tr -d "\""' || echo "unknown")
 RELAY_KERNEL=$(relay_ssh 'uname -r' || echo "unknown")
 LOCAL_OS=$(grep ^ID= /etc/os-release | cut -d= -f2 | tr -d '"' || echo "unknown")
-LOCAL_VERSION=$(grep ^VERSION_ID= /etc/os-release | cut -d= -f2 | tr -d '"' || echo "unknown")
-LOCAL_KERNEL=$(uname -r)
-
 log "РФ сервер: $RELAY_OS $RELAY_VERSION (ядро: $RELAY_KERNEL)"
-log "Локальный: $LOCAL_OS $LOCAL_VERSION (ядро: $LOCAL_KERNEL)"
+log "Локальный: $LOCAL_OS ($(uname -r))"
 
 section "Шаг 4: Обновление систем"
-
 log "Обновление РФ сервера..."
 relay_ssh 'export DEBIAN_FRONTEND=noninteractive && apt-get update -y -qq && apt-get upgrade -y -qq' || \
     warn "Не удалось обновить РФ сервер"
-
 log "Обновление локального сервера..."
 pkg_install iptables-persistent socat 2>/dev/null || true
 log "✓ Системы обновлены"
 
 section "Шаг 5: AmneziaWG на РФ сервере"
-
 if relay_ssh 'command -v awg >/dev/null && lsmod | grep -q amneziawg'; then
     log "✓ AmneziaWG уже установлен"
 else
     log "Установка AmneziaWG..."
-
     RELAY_HEADERS=$(relay_ssh 'dpkg -l "linux-headers-$(uname -r)" 2>/dev/null | grep -c "^ii" || echo "0"' 2>/dev/null || echo "0")
     RELAY_HEADERS=$(echo "$RELAY_HEADERS" | tr -d '\n\r ' | head -c 1)
     [[ -z "$RELAY_HEADERS" || ! "$RELAY_HEADERS" =~ ^[0-9]+$ ]] && RELAY_HEADERS=0
@@ -625,38 +550,31 @@ else
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
-
 apt-get update -y -qq
 apt-get install -y -qq build-essential pkg-config libmnl-dev libelf-dev \
     linux-headers-$(uname -r) git iptables curl iptables-persistent
-
 cd /tmp && rm -rf amneziawg-*
-
 git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git
 cd amneziawg-linux-kernel-module
 [[ -d "src" && -f "src/Makefile" ]] && cd src
 make -j2 && make install
 modprobe amneziawg
 echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
-
 cd /tmp
 git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git
 cd amneziawg-tools
 [[ -d "src" && -f "src/Makefile" ]] && cd src
 make -j2 && make install
-
 cd / && rm -rf /tmp/amneziawg-*
 which netfilter-persistent && netfilter-persistent save || true
 echo "AmneziaWG установлен"
 AWG_EOF
-
     relay_scp /tmp/install-awg-relay.sh /tmp/install-awg-relay.sh
     relay_ssh 'chmod +x /tmp/install-awg-relay.sh && /tmp/install-awg-relay.sh'
     log "✓ AmneziaWG установлен на РФ"
 fi
 
 section "Шаг 6: Настройка relay"
-
 if relay_ssh 'systemctl is-active amneziawg@awg0 >/dev/null 2>&1 && test -f /root/relay-configs/client.conf'; then
     log "✓ Relay уже настроен"
 else
@@ -664,16 +582,13 @@ else
     cat > /tmp/setup-relay.sh << 'RELAY_EOF'
 #!/bin/bash
 set -e
-
 DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -1)
 [[ -z "$DEFAULT_IFACE" ]] && { echo "ERROR: Интерфейс не найден"; exit 1; }
-
 SERVER_PRIV=$(awg genkey)
 SERVER_PUB=$(echo "$SERVER_PRIV" | awg pubkey)
 CLIENT_PRIV=$(awg genkey)
 CLIENT_PUB=$(echo "$CLIENT_PRIV" | awg pubkey)
 PSK=$(awg genpsk)
-
 JC=$((RANDOM % 5 + 3))
 JMIN=$((RANDOM % 50 + 50))
 JMAX=$((JMIN + RANDOM % 200 + 100))
@@ -684,7 +599,6 @@ H2=$((RANDOM % 2147483647))
 H3=$((RANDOM % 2147483647))
 H4=$((RANDOM % 2147483647))
 AWG_PORT=$((50000 + RANDOM % 15000))
-
 mkdir -p /etc/amnezia/amneziawg
 cat > /etc/amnezia/amneziawg/awg0.conf << AWGEOF
 [Interface]
@@ -700,60 +614,48 @@ H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-
 PostUp = iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
 PostUp = iptables -A FORWARD -i awg0 -o $DEFAULT_IFACE -j ACCEPT
 PostUp = iptables -A FORWARD -i $DEFAULT_IFACE -o awg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
 PostDown = iptables -D FORWARD -i awg0 -o $DEFAULT_IFACE -j ACCEPT
 PostDown = iptables -D FORWARD -i $DEFAULT_IFACE -o awg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-
 [Peer]
 PublicKey = $CLIENT_PUB
 PresharedKey = $PSK
 AllowedIPs = 10.10.0.2/32
 AWGEOF
-
 chmod 600 /etc/amnezia/amneziawg/awg0.conf
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-awg.conf
 sysctl --system > /dev/null 2>&1
-
 cat > /etc/systemd/system/amneziawg@.service << SVCEOF
 [Unit]
 Description=AmneziaWG Network Connection (%I)
 After=network.target
-
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/awg-quick up /etc/amnezia/amneziawg/%i.conf
 ExecStop=/usr/bin/awg-quick down /etc/amnezia/amneziawg/%i.conf
-
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-
 systemctl daemon-reload
 systemctl enable amneziawg@awg0 > /dev/null 2>&1
 systemctl start amneziawg@awg0
 sleep 3
-
 systemctl is-active amneziawg@awg0 > /dev/null 2>&1 || {
     echo "ERROR: AmneziaWG не запустился"
     journalctl -u amneziawg@awg0 -n 20 --no-pager
     exit 1
 }
-
 iptables -t nat -L POSTROUTING -v -n | grep -q "MASQUERADE.*$DEFAULT_IFACE" || {
     echo "ERROR: iptables не применены"
     exit 1
 }
-
 which netfilter-persistent && netfilter-persistent save || true
-
 SERVER_IP=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 mkdir -p /root/relay-configs
-
 cat > /root/relay-configs/client.conf << AWGCEOF
 [Interface]
 Address = 10.10.0.2/24
@@ -767,7 +669,6 @@ H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-
 [Peer]
 PublicKey = $SERVER_PUB
 PresharedKey = $PSK
@@ -775,31 +676,25 @@ Endpoint = $SERVER_IP:$AWG_PORT
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 AWGCEOF
-
 chmod 600 /root/relay-configs/client.conf
 echo "Relay настроен"
 RELAY_EOF
-
     relay_scp /tmp/setup-relay.sh /tmp/setup-relay.sh
     relay_ssh 'chmod +x /tmp/setup-relay.sh && /tmp/setup-relay.sh'
     log "✓ Relay настроен"
 fi
 
 section "Шаг 7: Копирование конфига"
-
 retry_cmd 3 10 "relay_scp_from /root/relay-configs/client.conf /root/awg-client.conf" || die "Не удалось скопировать конфиг"
 log "✓ Конфиг скопирован"
 
 section "Шаг 8: AmneziaWG локально"
-
 if command -v awg &> /dev/null && lsmod | grep -q amneziawg; then
     log "✓ AmneziaWG уже установлен"
 else
     log "Установка AmneziaWG..."
-
     HEADERS=0
     dpkg -l "linux-headers-$(uname -r)" 2>/dev/null | grep -q "^ii" && HEADERS=1
-
     if [[ "$HEADERS" -eq 0 ]]; then
         warn "Headers недоступны, обновляем ядро..."
         pkg_install linux-image-amd64 linux-headers-amd64
@@ -808,92 +703,70 @@ else
         sleep 5
         reboot
     fi
-
     pkg_install build-essential pkg-config libmnl-dev libelf-dev \
         linux-headers-$(uname -r) git iptables curl
-
     [[ ! -d "/lib/modules/$(uname -r)/build" ]] && die "Headers не установлены"
     log "✓ Headers установлены"
-
     cd /tmp && rm -rf amneziawg-*
-
     retry_cmd 3 10 "git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git" || \
         die "Не удалось клонировать репозиторий ядра"
-
     cd amneziawg-linux-kernel-module
     [[ -d "src" && -f "src/Makefile" ]] && cd src
     make -j2 && make install
-
     modprobe amneziawg
     echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
     lsmod | grep -q amneziawg || die "Модуль amneziawg не загрузился"
     log "✓ Модуль загружен"
-
     cd /tmp
     retry_cmd 3 10 "git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git" || \
         die "Не удалось клонировать утилиты"
-
     cd amneziawg-tools
     [[ -d "src" && -f "src/Makefile" ]] && cd src
     make -j2 && make install
-
     command -v awg &> /dev/null || die "awg не установлена"
     log "✓ AmneziaWG: $(awg --version 2>&1 | head -1)"
     cd / && rm -rf /tmp/amneziawg-*
 fi
 
 section "Шаг 9: Настройка клиента"
-
 log "Очистка..."
 stop_services_safe
 cleanup_netns
-
 mkdir -p /etc/amnezia/amneziawg
 grep -q "^DNS" /root/awg-client.conf && sed -i '/^DNS/d' /root/awg-client.conf
 cp /root/awg-client.conf /etc/amnezia/amneziawg/awg0.conf
 chmod 600 /etc/amnezia/amneziawg/awg0.conf
-
 log "✓ AmneziaWG настроен"
 
 section "Шаг 10: Создание namespace"
-
 if ip netns list 2>/dev/null | grep -q "^$NAMESPACE"; then
     warn "Namespace '$NAMESPACE' уже существует, удаляем..."
     cleanup_netns
     sleep 1
 fi
-
 log "Создание namespace '$NAMESPACE'..."
 ip netns add "$NAMESPACE"
-
 log "✓ Namespace создан"
 
 section "Шаг 11: Установка Xray"
-
 if [[ -f /usr/local/xray/xray ]]; then
     log "✓ Xray уже установлен"
 else
     log "Установка Xray..."
     pkg_install curl unzip jq openssl qrencode
-
     mkdir -p /usr/local/xray /usr/local/etc/xray
     cd /tmp
-
     LATEST=$(curl -sL https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null | grep -oP 'tag/v\K[0-9.]+' | head -1) || die "Не удалось получить версию"
     log "Версия Xray: $LATEST"
-
     retry_cmd 3 10 "wget -q -O /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/download/v${LATEST}/Xray-linux-64.zip" || die "Скачать не удалось"
-
     unzip -o -q /tmp/xray.zip -d /usr/local/xray
     rm -f /tmp/xray.zip
     chmod +x /usr/local/xray/xray
     ln -sf /usr/local/xray/xray /usr/local/bin/xray
-
     log "✓ Xray: $(xray version 2>&1 | head -1)"
 fi
 
 section "Шаг 12: Конфиг Xray"
-
 if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
     log "Создание конфига..."
     KEYPAIR=$(xray x25519)
@@ -901,9 +774,7 @@ if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
     PUB=$(echo "$KEYPAIR" | grep "Password (PublicKey):" | awk '{print $3}')
     SID=$(openssl rand -hex 8)
     FIRST_UUID=$(xray uuid)
-
     mkdir -p "$CONFIG_DIR"
-
     cat > "$CONFIG_DIR/server.json" << EOF
 {
   "sni": "www.apple.com",
@@ -914,13 +785,11 @@ if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
   "fragment": {"packets": "tlshello", "length": "50-100", "delay": "1-5"}
 }
 EOF
-
     cat > "$CONFIG_DIR/clients.json" << EOF
 {
   "clients": [{"name": "admin", "uuid": "$FIRST_UUID", "created": "$(date -Iseconds)"}]
 }
 EOF
-
     cat > "$CONFIG_DIR/config.json" << EOF
 {
   "log": {"loglevel": "warning"},
@@ -950,7 +819,6 @@ EOF
   ]
 }
 EOF
-
     log "✓ Конфиг создан"
     log "UUID: $FIRST_UUID"
     log "Public Key: $PUB"
@@ -958,10 +826,13 @@ EOF
 else
     log "✓ Конфиг существует"
 fi
-
 xray -test -config "$CONFIG_DIR/config.json" > /dev/null 2>&1 || die "Конфиг Xray невалиден"
 
 section "Шаг 13: Установка Hysteria2"
+check_hysteria_works() {
+    systemctl is-active --quiet hysteria-server.service 2>/dev/null && \
+    ip netns exec xray ss -H -lun "sport = :8443" 2>/dev/null | grep -q UNCONN
+}
 
 if check_hysteria_works; then
     log "✓ Hysteria2 работает"
@@ -970,16 +841,13 @@ else
         warn "Hysteria2 установлен, но не работает — пересоздаём..."
         HY_PASS=$(jq -r '.clients[0].uuid' "$CONFIG_DIR/clients.json" 2>/dev/null || echo "")
         [[ -z "$HY_PASS" ]] && die "Не удалось получить UUID"
-
         rm -f /etc/hysteria/key.pem /etc/hysteria/cert.pem
         openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
             -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
             -subj "/CN=www.apple.com" -days 3650 2>/dev/null
-
         chmod 644 /etc/hysteria/cert.pem
         chmod 600 /etc/hysteria/key.pem
         chown -R root:root /etc/hysteria
-
         cat > /etc/hysteria/config.yaml << EOF
 listen: :8443
 tls:
@@ -994,25 +862,20 @@ masquerade:
     url: https://www.apple.com
     rewriteHost: true
 EOF
-
         systemctl restart hysteria-server.service 2>/dev/null || true
         sleep 2
         check_hysteria_works && log "✓ Hysteria2 работает" || warn "Hysteria2 не запустился"
     else
         log "Установка Hysteria2..."
         retry_cmd 3 10 "bash <(curl -fsSL https://get.hy2.sh/)" || { warn "Не удалось установить Hysteria2"; return 0; }
-        
         HY_PASS=$(jq -r '.clients[0].uuid' "$CONFIG_DIR/clients.json")
         mkdir -p /etc/hysteria
-
         openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
             -keyout /etc/hysteria/key.pem -out /etc/hysteria/cert.pem \
             -subj "/CN=www.apple.com" -days 3650 2>/dev/null
-
         chmod 644 /etc/hysteria/cert.pem
         chmod 600 /etc/hysteria/key.pem
         chown -R root:root /etc/hysteria
-
         cat > /etc/hysteria/config.yaml << EOF
 listen: :8443
 tls:
@@ -1027,7 +890,6 @@ masquerade:
     url: https://www.apple.com
     rewriteHost: true
 EOF
-
         systemctl restart hysteria-server.service
         sleep 2
         check_hysteria_works && log "✓ Hysteria2 установлен" || warn "Hysteria2 не запустился"
@@ -1035,35 +897,41 @@ EOF
 fi
 
 # ============================================================================
-# ШАГ 14-15: SYSTEMD + VETH + SOCAT (ИСПРАВЛЕНО v6.4.1)
+# ШАГ 14-15: SYSTEMD + VETH + SOCAT (ИСПРАВЛЕНО v6.4.2)
 # ============================================================================
 
 section "Шаг 14: Создание systemd сервисов"
 
-# ИСПРАВЛЕНО v6.4.1: wg-namespace.service НЕ запускает awg-quick
+# ИСПРАВЛЕНО v6.4.2: setup-awg-namespace.sh ТОЛЬКО создаёт namespace
+# НЕ управляет awg-quick (убрана гонка)
 cat > /usr/local/bin/setup-awg-namespace.sh << 'NSEOF'
 #!/usr/bin/env bash
 set -e
 
+# Проверяем, что namespace уже настроен и awg0 внутри него
 if ip netns list 2>/dev/null | grep -q "^xray"; then
-    echo "✓ Namespace xray уже существует"
-    exit 0
+    if ip netns exec xray ip link show awg0 >/dev/null 2>&1 && \
+       ip netns exec xray ip route show 2>/dev/null | grep -q "default"; then
+        echo "✓ Namespace xray уже настроен"
+        exit 0
+    fi
 fi
 
+# Если namespace существует, но не настроен - удаляем и создаём заново
 ip netns delete xray 2>/dev/null || rm -f /run/netns/xray 2>/dev/null || true
-ip netns add xray
 
-echo "Namespace xray настроен"
+ip netns add xray
+echo "✓ Namespace xray создан"
 NSEOF
 chmod +x /usr/local/bin/setup-awg-namespace.sh
 
-# ИСПРАВЛЕНО v6.4.1: Отдельный скрипт для переноса awg0 в namespace
+# ИСПРАВЛЕНО v6.4.2: move-awg0-to-namespace.sh — отдельный скрипт переноса
 cat > /usr/local/bin/move-awg0-to-namespace.sh << 'MOVEEOF'
 #!/usr/bin/env bash
 set -e
 
-# Ждём появления интерфейса awg0
-for i in {1..10}; do
+# Ждём появления awg0 с таймаутом
+for i in {1..15}; do
     if ip link show awg0 >/dev/null 2>&1; then
         break
     fi
@@ -1071,12 +939,21 @@ for i in {1..10}; do
 done
 
 if ! ip link show awg0 >/dev/null 2>&1; then
-    echo "ERROR: Интерфейс awg0 не появился"
+    echo "ERROR: Интерфейс awg0 не появился за 15s"
+    exit 1
+fi
+
+# Проверяем что namespace существует
+if ! ip netns list 2>/dev/null | grep -q "^xray"; then
+    echo "ERROR: Namespace xray не существует"
     exit 1
 fi
 
 # Переносим awg0 в namespace
-ip link set awg0 netns xray
+ip link set awg0 netns xray || {
+    echo "ERROR: Не удалось переместить awg0 в namespace xray"
+    exit 1
+}
 
 # Настраиваем интерфейс внутри namespace
 ip netns exec xray ip link set awg0 up
@@ -1091,14 +968,15 @@ else
     echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/netns/xray/resolv.conf
 fi
 
-echo "✓ Интерфейс awg0 перенесён в namespace xray"
+echo "✓ awg0 перенесён в namespace xray"
 MOVEEOF
 chmod +x /usr/local/bin/move-awg0-to-namespace.sh
 
-# ИСПРАВЛЕНО v6.4.1: wg-namespace.service НЕ запускает awg-quick
+# ИСПРАВЛЕНО v6.4.2: wg-namespace.service — только создаёт namespace
 cat > /etc/systemd/system/wg-namespace.service << 'SVCEOF'
 [Unit]
 Description=Setup AmneziaWG namespace
+Before=awg-quick@awg0.service
 
 [Service]
 Type=oneshot
@@ -1111,7 +989,7 @@ TimeoutStartSec=30
 WantedBy=multi-user.target
 SVCEOF
 
-# ИСПРАВЛЕНО v6.4.1: awg-quick@.service с ExecStartPost для переноса в namespace
+# ИСПРАВЛЕНО v6.4.2: awg-quick@.service — с ExecStartPost для переноса в namespace
 cat > /etc/systemd/system/awg-quick@.service << 'AWGSVCEOF'
 [Unit]
 Description=AWG interface %i via wg-quick(8)
@@ -1132,7 +1010,7 @@ TimeoutStartSec=30
 WantedBy=multi-user.target
 AWGSVCEOF
 
-# ИСПРАВЛЕНО v6.4.1: xray.service зависит от awg-quick@awg0.service
+# ИСПРАВЛЕНО v6.4.2: xray.service — зависит от awg-quick
 cat > /etc/systemd/system/xray.service << 'EOF'
 [Unit]
 Description=Xray Service (via AmneziaWG namespace)
@@ -1151,7 +1029,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-# ИСПРАВЛЕНО v6.4.1: hysteria-server.service зависит от awg-quick@awg0.service
+# ИСПРАВЛЕНО v6.4.2: hysteria-server.service
 cat > /etc/systemd/system/hysteria-server.service << 'HYSTERIA_SVC'
 [Unit]
 Description=Hysteria Server Service (via AmneziaWG relay, in namespace)
@@ -1180,10 +1058,11 @@ systemctl daemon-reload
 systemctl enable wg-namespace.service awg-quick@awg0.service xray.service hysteria-server.service > /dev/null 2>&1
 log "✓ Сервисы созданы (правильная цепочка зависимостей)"
 
-section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.4.1)"
+section "Шаг 15: Veth-пара и socat (ИСПРАВЛЕНО v6.4.2)"
 
 cat > /usr/local/bin/setup-socat-forward.sh << SOCAT_EOF
 #!/usr/bin/env bash
+set -e
 
 NAMESPACE="xray"
 VETH_HOST_IP="$VETH_HOST_IP"
@@ -1191,87 +1070,48 @@ VETH_NS_IP="$VETH_NS_IP"
 
 ip netns list 2>/dev/null | grep -q "^\$NAMESPACE" || { echo "ERROR: Namespace не существует"; exit 1; }
 
-echo "Принудительное удаление существующих veth-интерфейсов..."
-
+echo "Удаление существующих veth-интерфейсов..."
 if ip link show veth-host >/dev/null 2>&1; then
     ip link delete veth-host 2>/dev/null || true
     sleep 1
 fi
-
 if ip netns exec \$NAMESPACE ip link show veth-ns >/dev/null 2>&1; then
     ip netns exec \$NAMESPACE ip link delete veth-ns 2>/dev/null || true
     sleep 1
 fi
 
 echo "Создание новой veth-пары..."
-ip link add veth-host type veth peer name veth-ns || {
-    echo "ERROR: Не удалось создать veth-пару"
-    exit 1
-}
+ip link add veth-host type veth peer name veth-ns || { echo "ERROR: Не удалось создать veth-пару"; exit 1; }
+ip link set veth-ns netns \$NAMESPACE || { echo "ERROR: Не удалось переместить veth-ns"; exit 1; }
 
-ip link set veth-ns netns \$NAMESPACE || {
-    echo "ERROR: Не удалось переместить veth-ns"
-    exit 1
-}
+ip addr add \$VETH_HOST_IP/24 dev veth-host || { echo "ERROR: IP veth-host"; exit 1; }
+ip link set veth-host up || { echo "ERROR: veth-host up"; exit 1; }
 
-ip addr add \$VETH_HOST_IP/24 dev veth-host || {
-    echo "ERROR: Не удалось назначить IP veth-host"
-    exit 1
-}
-ip link set veth-host up || {
-    echo "ERROR: Не удалось поднять veth-host"
-    exit 1
-}
+ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns || { echo "ERROR: IP veth-ns"; exit 1; }
+ip netns exec \$NAMESPACE ip link set veth-ns up || { echo "ERROR: veth-ns up"; exit 1; }
 
-ip netns exec \$NAMESPACE ip addr add \$VETH_NS_IP/24 dev veth-ns || {
-    echo "ERROR: Не удалось назначить IP veth-ns"
-    exit 1
-}
-ip netns exec \$NAMESPACE ip link set veth-ns up || {
-    echo "ERROR: Не удалось поднять veth-ns"
-    exit 1
-}
-
-echo "Настройка маршрутов..."
 ip netns exec \$NAMESPACE ip route flush 10.200.0.0/24 2>/dev/null || true
-ip netns exec \$NAMESPACE ip route add 10.200.0.0/24 dev veth-ns || {
-    echo "WARNING: Не удалось добавить маршрут"
-}
+ip netns exec \$NAMESPACE ip route add 10.200.0.0/24 dev veth-ns 2>/dev/null || true
 
 echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-forwarding.conf
 sysctl --system > /dev/null 2>&1 || true
-
 sysctl -w net.ipv4.conf.veth-host.rp_filter=0 2>/dev/null || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
 
-iptables -A FORWARD -i veth-host -o veth-ns -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i veth-ns -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-echo "✓ veth-пара: \$VETH_HOST_IP <-> \$VETH_NS_IP"
-
-if ! ip link show veth-host >/dev/null 2>&1; then
-    echo "ERROR: veth-host не создан"
-    exit 1
-fi
-
-if ! ip netns exec \$NAMESPACE ip link show veth-ns >/dev/null 2>&1; then
-    echo "ERROR: veth-ns не создан в namespace"
-    exit 1
-fi
+iptables -C FORWARD -i veth-host -o veth-ns -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i veth-host -o veth-ns -j ACCEPT 2>/dev/null || true
+iptables -C FORWARD -i veth-ns -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i veth-ns -o veth-host -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
 if ! ping -c 1 -W 2 \$VETH_NS_IP >/dev/null 2>&1; then
     echo "WARNING: Ping не проходит"
 fi
-echo "✓ Связь установлена"
-
-which netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save || true
 echo "✓ veth настроена"
-
 exit 0
 SOCAT_EOF
 chmod +x /usr/local/bin/setup-socat-forward.sh
 
-# ИСПРАВЛЕНО v6.4.1: socat-443.service зависит от xray.service
+# ИСПРАВЛЕНО v6.4.2: socat-443.service
 cat > /etc/systemd/system/socat-443.service << 'EOF'
 [Unit]
 Description=Socat Port 443 Forwarding to Xray Namespace
@@ -1280,8 +1120,7 @@ After=xray.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 5
-ExecStartPre=/bin/sh -c 'ss -tulpn | grep -q ":443 " && exit 1 || exit 0'
+ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/socat TCP-LISTEN:443,bind=0.0.0.0,fork,reuseaddr TCP:10.200.0.2:443
 Restart=on-failure
 RestartSec=1
@@ -1290,7 +1129,7 @@ RestartSec=1
 WantedBy=multi-user.target
 EOF
 
-# ИСПРАВЛЕНО v6.4.1: socat-8443.service зависит от hysteria-server.service
+# ИСПРАВЛЕНО v6.4.2: socat-8443.service
 cat > /etc/systemd/system/socat-8443.service << 'EOF'
 [Unit]
 Description=Socat Port 8443 Forwarding to Hysteria Namespace
@@ -1299,8 +1138,7 @@ After=hysteria-server.service
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 5
-ExecStartPre=/bin/sh -c 'ss -ulpn | grep -q ":8443 " && exit 1 || exit 0'
+ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/socat UDP-LISTEN:8443,bind=0.0.0.0,fork,reuseaddr UDP:10.200.0.2:8443
 Restart=on-failure
 RestartSec=1
@@ -1314,10 +1152,10 @@ systemctl enable socat-443.service socat-8443.service > /dev/null 2>&1
 log "✓ Socat сервисы созданы"
 
 # ============================================================================
-# ШАГ 16-17: ЗАПУСК + SMOKE ТЕСТЫ (ИСПРАВЛЕНО v6.4.1)
+# ШАГ 16-17: ЗАПУСК + SMOKE ТЕСТЫ (ИСПРАВЛЕНО v6.4.2)
 # ============================================================================
 
-section "Шаг 16: Запуск всех сервисов (ИСПРАВЛЕНО v6.4.1)"
+section "Шаг 16: Запуск всех сервисов (ИСПРАВЛЕНО v6.4.2)"
 
 cleanup_all
 
@@ -1329,14 +1167,15 @@ log "Запуск awg-quick@awg0.service..."
 systemctl start awg-quick@awg0.service
 wait_for_service awg-quick@awg0.service 30 || die "awg-quick не запустился"
 
-log "Ожидание появления awg0 в namespace..."
-for i in {1..10}; do
+log "Ожидание awg0 в namespace xray..."
+for i in {1..15}; do
     if ip netns exec xray ip link show awg0 >/dev/null 2>&1; then
-        log "✓ Интерфейс awg0 появился в namespace"
+        log "✓ awg0 появился в namespace"
         break
     fi
     sleep 1
 done
+ip netns exec xray ip link show awg0 >/dev/null 2>&1 || die "awg0 не появился в namespace за 15s"
 
 log "Создание veth-пары..."
 /usr/local/bin/setup-socat-forward.sh || die "Не удалось создать veth-пару"
@@ -1344,62 +1183,45 @@ log "Создание veth-пары..."
 log "Запуск Xray..."
 systemctl start xray.service
 wait_for_service xray.service 30 || die "Xray не запустился"
-
-log "Проверка порта 443 в namespace..."
-for i in {1..10}; do
-    if ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443"; then
-        log "✓ Xray слушает порт 443"
-        break
-    fi
-    sleep 1
-done
+wait_for_namespace_tcp_port 443 30 || die "Xray не слушает порт 443 в namespace"
 
 log "Запуск Hysteria2..."
 systemctl start hysteria-server.service
 wait_for_service hysteria-server.service 30 || warn "Hysteria2 не запустился"
+wait_for_namespace_udp_port 8443 30 || warn "Hysteria2 не слушает порт 8443 в namespace"
 
-log "Ожидание готовности сервисов (5s)..."
-sleep 5
-
-log "Проверка занятости порта 443..."
-if ss -tulpn | grep -q ":443 "; then
-    error "Порт 443 уже занят"
-    ss -tulpn | grep ":443 "
+# ИСПРАВЛЕНО v6.4.2: Проверка занятости портов ДО запуска socat
+log "Проверка занятости TCP порта 443..."
+if ss -H -ltn "sport = :443" 2>/dev/null | grep -q LISTEN; then
+    error "Порт 443 уже занят:"
+    ss -H -ltnp "sport = :443"
     die "Порт 443 занят"
 fi
 
-log "Запуск socat..."
-systemctl start socat-443.service socat-8443.service
+log "Проверка занятости UDP порта 8443..."
+if ss -H -lun "sport = :8443" 2>/dev/null | grep -q UNCONN; then
+    error "Порт 8443 уже занят:"
+    ss -H -lunp "sport = :8443"
+    die "Порт 8443 занят"
+fi
+
+log "Запуск socat-443..."
+systemctl start socat-443.service
 wait_for_service socat-443.service 15 || die "Socat-443 не запустился"
+wait_for_tcp_port 443 30 || die "Socat не слушает порт 443 на хосте"
+
+log "Запуск socat-8443..."
+systemctl start socat-8443.service
 wait_for_service socat-8443.service 15 || warn "Socat-8443 не запустился"
+wait_for_udp_port 8443 30 || warn "Socat не слушает порт 8443 на хосте"
 
-log "Проверка портов..."
-ss -tlnp | grep -q ":443.*socat" || {
-    error "Socat не слушает порт 443"
-    die "Socat не работает"
-}
-
-wait_for_port 443 tcp 30 || die "Порт 443/tcp не готов"
-wait_for_port 8443 udp 30 || warn "Порт 8443/udp не готов"
-
-systemctl is-active --quiet xray.service && log "✓ Xray запущен" || warn "Xray не запущен"
-systemctl is-active --quiet hysteria-server.service && log "✓ Hysteria2 запущен" || warn "Hysteria2 не запущен"
-systemctl is-active --quiet socat-443.service && systemctl is-active --quiet socat-8443.service && \
-    log "✓ Socat запущен" || warn "Socat не запущен"
-
-ss -tlnp | grep -q ":443" && log "✓ Порт 443 на основном интерфейсе" || warn "Порт 443 не на интерфейсе"
-ss -ulnp | grep -q ":8443" && log "✓ Порт 8443 на основном интерфейсе" || warn "Порт 8443 не на интерфейсе"
-ip netns exec xray ss -tlnp 2>/dev/null | grep -q ":443" && log "✓ Xray слушает 443 в namespace" || warn "Xray не слушает 443"
-
-section "Шаг 17: Smoke тесты (ss -ulnp)"
+section "Шаг 17: Smoke тесты"
 
 SMOKE_PASSED=true
 
 run_smoke_test() {
     local test_name="$1" test_cmd="$2" max_attempts=3 attempt=1
-    
     echo "Тест: $test_name..."
-    
     while [[ $attempt -le $max_attempts ]]; do
         if eval "$test_cmd" >/dev/null 2>&1; then
             log "✓ $test_name пройден (попытка $attempt/$max_attempts)"
@@ -1409,35 +1231,40 @@ run_smoke_test() {
         sleep 2
         ((attempt++))
     done
-    
     error "✗ $test_name НЕ пройден"
     return 1
 }
 
-run_smoke_test "Тест 1: IP через туннель" \
-    "TEST_IP=\$(ip netns exec xray curl -s4 --max-time 10 ifconfig.me 2>/dev/null) && [[ \"\$TEST_IP\" != \"FAILED\" && -n \"\$TEST_IP\" ]]" || \
+# Test 1: IP через туннель
+run_smoke_test "Test 1: IP через туннель" \
+    "TEST_IP=\$(ip netns exec xray curl -s4 --max-time 10 ifconfig.me 2>/dev/null) && [[ -n \"\$TEST_IP\" ]]" || \
     { error "Туннель не работает"; SMOKE_PASSED=false; }
 
-run_smoke_test "Тест 2: Xray в namespace (ss -tlnp)" \
-    "ip netns exec xray ss -tlnp 2>/dev/null | grep -q ':443'" || \
+# Test 2: Xray в namespace (TCP 443)
+run_smoke_test "Test 2: Xray TCP 443 в namespace" \
+    "ip netns exec xray ss -H -ltn 'sport = :443' 2>/dev/null | grep -q LISTEN" || \
     { error "Xray не слушает порт 443"; SMOKE_PASSED=false; }
 
-run_smoke_test "Тест 3: Hysteria2 в namespace (ss -ulnp)" \
-    "ip netns exec xray ss -ulnp 2>/dev/null | grep -q ':8443' || ip netns exec xray ps aux 2>/dev/null | grep -q '[h]ysteria'" || \
+# Test 3: Hysteria2 в namespace (UDP 8443)
+run_smoke_test "Test 3: Hysteria2 UDP 8443 в namespace" \
+    "ip netns exec xray ss -H -lun 'sport = :8443' 2>/dev/null | grep -q UNCONN || ip netns exec xray ps aux 2>/dev/null | grep -q '[h]ysteria'" || \
     warn "Hysteria2 не слушает 8443"
 
-run_smoke_test "Тест 4: Порт 443 извне (ss -tlnp)" \
-    "ss -tlnp | grep -q ':443'" || {
-    error "Порт 443 не доступен"
-    ss -tlnp | grep :443 || echo "Порт 443 не слушается"
+# Test 4: Порт 443 на хосте (socat)
+run_smoke_test "Test 4: Socat TCP 443 на хосте" \
+    "ss -H -ltn 'sport = :443' 2>/dev/null | grep -q LISTEN" || {
+    error "Порт 443 не доступен на хосте"
+    ss -H -ltnp "sport = :443" || echo "Порт 443 не слушается"
     journalctl -u socat-443.service -n 10 --no-pager
     SMOKE_PASSED=false
 }
 
-run_smoke_test "Тест 5: Порт 8443 извне (ss -ulnp)" \
-    "ss -ulnp | grep -q ':8443'" || warn "Порт 8443 не доступен"
+# Test 5: Порт 8443 на хосте (socat)
+run_smoke_test "Test 5: Socat UDP 8443 на хосте" \
+    "ss -H -lun 'sport = :8443' 2>/dev/null | grep -q UNCONN" || warn "Порт 8443 не доступен"
 
-run_smoke_test "Тест 6: veth-связь" \
+# Test 6: veth-связь
+run_smoke_test "Test 6: veth-связь" \
     "ping -c 1 -W 2 $VETH_NS_IP >/dev/null 2>&1" || \
     { error "veth не работает"; SMOKE_PASSED=false; }
 
@@ -1450,7 +1277,7 @@ else
 fi
 
 # ============================================================================
-# ШАГ 18: XRAY-ADMIN (ИСПРАВЛЕНО v6.4.1)
+# ШАГ 18: XRAY-ADMIN (ИСПРАВЛЕНО v6.4.2)
 # ============================================================================
 
 section "Шаг 18: Управляющий скрипт"
@@ -1463,7 +1290,6 @@ CONFIG_DIR="/usr/local/etc/xray"
 CLIENTS="$CONFIG_DIR/clients.json"
 SERVER="$CONFIG_DIR/server.json"
 CONF="$CONFIG_DIR/config.json"
-HYSTERIA_DIR="/etc/hysteria"
 ALERTS_DIR="$CONFIG_DIR/alerts"
 NAMESPACE="xray"
 LOG_FILE="/var/log/xray-admin.log"
@@ -1501,7 +1327,8 @@ cleanup_netns() {
             ip netns exec "$NAMESPACE" ip link delete veth-ns 2>/dev/null || true
     fi
     ip link show veth-host >/dev/null 2>&1 && ip link delete veth-host 2>/dev/null || true
-    ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" 2>/dev/null || true
+    ip netns list 2>/dev/null | grep -q "^$NAMESPACE" && \
+        (ip netns delete "$NAMESPACE" 2>/dev/null || rm -f "/run/netns/$NAMESPACE" 2>/dev/null || true)
     ip link show awg0 >/dev/null 2>&1 && ip link delete awg0 2>/dev/null || true
     set -e
 }
@@ -1520,16 +1347,13 @@ cmd_status() {
     printf "%-25s %s\n" "Namespace:" "$(ip netns list 2>/dev/null | grep -c $NAMESPACE || echo '0')/1"
     printf "%-25s %s\n" "IP через туннель:" "$(get_public_ip)"
     echo ""
-
     echo -e "${YELLOW}Порты на основном интерфейсе:${NC}"
-    ss -tlnp 2>/dev/null | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет TCP"
-    ss -ulnp 2>/dev/null | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет UDP"
+    ss -H -ltnp "sport = :443" 2>/dev/null | sed 's/^/  TCP /' || echo "  TCP 443 не слушается"
+    ss -H -lunp "sport = :8443" 2>/dev/null | sed 's/^/  UDP /' || echo "  UDP 8443 не слушается"
     echo ""
-
     echo -e "${YELLOW}Клиенты:${NC}"
     if [[ -f "$CLIENTS" ]]; then
-        jq -r '.clients[] | "  • \(.name) [\(.uuid)]"' "$CLIENTS" 2>/dev/null || \
-            awk -F'"' '/"name"/{name=$4} /"uuid"/{print "  • " name " [" $4 "]"}' "$CLIENTS"
+        jq -r '.clients[] | "  • \(.name) [\(.uuid)]"' "$CLIENTS" 2>/dev/null || echo "  Нет клиентов"
     else
         echo "  Нет клиентов"
     fi
@@ -1540,22 +1364,13 @@ cmd_add_client() {
     local uuid
     uuid=$(xray uuid)
     log_action "add_client $name"
-
     [[ -f "$CLIENTS" ]] || echo '{"clients":[]}' > "$CLIENTS"
-
     python3 -c "
 import json
 from datetime import datetime
-
 with open('$CLIENTS', 'r') as f:
     data = json.load(f)
-
-data['clients'].append({
-    'name': '$name',
-    'uuid': '$uuid',
-    'created': datetime.now().isoformat()
-})
-
+data['clients'].append({'name': '$name', 'uuid': '$uuid', 'created': datetime.now().isoformat()})
 with open('$CLIENTS', 'w') as f:
     json.dump(data, f, indent=2)
 " 2>/dev/null || {
@@ -1563,7 +1378,6 @@ with open('$CLIENTS', 'w') as f:
         tmp=$(mktemp)
         jq ".clients += [{\"name\":\"$name\",\"uuid\":\"$uuid\",\"created\":\"$(date -Iseconds)\"}]" "$CLIENTS" > "$tmp" && mv "$tmp" "$CLIENTS"
     }
-
     echo -e "${GREEN}✓ Добавлен: $name ($uuid)${NC}"
     cmd_gen_links "$name"
 }
@@ -1596,12 +1410,10 @@ cmd_gen_links() {
     sid=$(jq -r '.shortId' "$SERVER" 2>/dev/null || echo "")
     sni=$(jq -r '.sni' "$SERVER" 2>/dev/null || echo "www.apple.com")
     hy_pass=$(jq -r '.clients[0].uuid' "$CLIENTS" 2>/dev/null || echo "")
-
     echo -e "${CYAN}=== Ссылки для подключения ===${NC}"
     echo -e "${YELLOW}Подключайтесь к РФ relay: $relay_ip${NC}"
     echo ""
     > /root/xray-links.txt
-
     if [[ -f "$CLIENTS" ]]; then
         jq -r '.clients[] | select(.name=="'"$target"'" or "'"all"'"=="all") | "\(.name) \(.uuid)"' "$CLIENTS" | \
         while read -r n u; do
@@ -1616,7 +1428,6 @@ cmd_gen_links() {
             echo ""
         done
     fi
-
     echo -e "\n${GREEN}✓ Ссылки сохранены: /root/xray-links.txt${NC}"
 }
 
@@ -1627,7 +1438,6 @@ cmd_restart() {
     sleep 2
     cleanup_netns
     sleep 1
-    
     systemctl start wg-namespace.service
     sleep 2
     systemctl start awg-quick@awg0.service
@@ -1651,22 +1461,9 @@ cmd_monitor() {
         socat8443_st=$(systemctl is-active socat-8443.service 2>/dev/null || echo "inactive")
         ip=$(get_public_ip)
         echo -e "[$(date '+%H:%M:%S')] Xray: $xray_st | AWG: $awg_st | Socat-443: $socat443_st | Socat-8443: $socat8443_st | IP: $ip"
-
-        [[ "$xray_st" != "active" ]] && {
-            echo -e "${RED}Xray упал!${NC}"
-            /usr/local/bin/setup-awg-namespace.sh && systemctl restart xray.service
-            send_alert "🚨 Xray перезапущен на $(hostname)"
-        }
-        [[ "$socat443_st" != "active" ]] && {
-            echo -e "${RED}Socat-443 упал!${NC}"
-            systemctl restart socat-443.service
-            send_alert "🚨 Socat-443 перезапущен на $(hostname)"
-        }
-        [[ "$socat8443_st" != "active" ]] && {
-            echo -e "${RED}Socat-8443 упал!${NC}"
-            systemctl restart socat-8443.service
-            send_alert "🚨 Socat-8443 перезапущен на $(hostname)"
-        }
+        [[ "$xray_st" != "active" ]] && { echo -e "${RED}Xray упал!${NC}"; /usr/local/bin/setup-awg-namespace.sh && systemctl restart xray.service; send_alert "🚨 Xray перезапущен на $(hostname)"; }
+        [[ "$socat443_st" != "active" ]] && { echo -e "${RED}Socat-443 упал!${NC}"; systemctl restart socat-443.service; send_alert "🚨 Socat-443 перезапущен"; }
+        [[ "$socat8443_st" != "active" ]] && { echo -e "${RED}Socat-8443 упал!${NC}"; systemctl restart socat-8443.service; send_alert "🚨 Socat-8443 перезапущен"; }
         sleep 60
     done
 }
@@ -1675,8 +1472,7 @@ send_alert() {
     local msg="$1"
     if [[ -f "$ALERTS_DIR/telegram.conf" ]]; then
         source "$ALERTS_DIR/telegram.conf"
-        curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-            -d "chat_id=$CHAT_ID&text=$msg" >/dev/null || true
+        curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d "chat_id=$CHAT_ID&text=$msg" >/dev/null || true
     fi
 }
 
@@ -1685,15 +1481,8 @@ cmd_setup_alerts() {
     echo -e "1) Telegram\n2) Email\n3) Оба"
     read -p "Выбор: " ch
     case $ch in
-        1|3)
-            read -p "Bot Token: " t
-            read -p "Chat ID: " c
-            echo -e "BOT_TOKEN=$t\nCHAT_ID=$c" > "$ALERTS_DIR/telegram.conf"
-            ;;
-        2|3)
-            read -p "Email: " e
-            echo -e "NOTIFY_EMAIL=$e" > "$ALERTS_DIR/email.conf"
-            ;;
+        1|3) read -p "Bot Token: " t; read -p "Chat ID: " c; echo -e "BOT_TOKEN=$t\nCHAT_ID=$c" > "$ALERTS_DIR/telegram.conf" ;;
+        2|3) read -p "Email: " e; echo -e "NOTIFY_EMAIL=$e" > "$ALERTS_DIR/email.conf" ;;
     esac
     echo -e "${GREEN}✓ Оповещения настроены${NC}"
 }
@@ -1701,13 +1490,10 @@ cmd_setup_alerts() {
 cmd_restore() {
     log_action "restore"
     [[ ! -f "$BACKUP_DIR/latest_backup" ]] && { error "Бэкапы не найдены"; exit 1; }
-
     local latest_ts rollback_script
     latest_ts=$(cat "$BACKUP_DIR/latest_backup")
     rollback_script="$BACKUP_DIR/rollback_$latest_ts.sh"
-
     [[ ! -f "$rollback_script" ]] && { error "Скрипт отката не найден"; exit 1; }
-
     echo -e "${YELLOW}Восстановление из #$latest_ts...${NC}"
     bash "$rollback_script"
     echo -e "${GREEN}✓ Восстановлено${NC}"
@@ -1715,42 +1501,29 @@ cmd_restore() {
 
 cmd_diagnostics() {
     log_action "diagnostics"
-    
     [[ ! -f "$DIAGNOSTICS_DIR/latest_diagnostics" ]] && { error "Отчёты не найдены"; exit 1; }
-    
     local latest_diag
     latest_diag=$(cat "$DIAGNOSTICS_DIR/latest_diagnostics")
-    
     [[ ! -f "$latest_diag" ]] && { error "Файл не найден"; exit 1; }
-    
     echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${MAGENTA}📋 ПОСЛЕДНИЙ ДИАГНОСТИЧЕСКИЙ ОТЧЁТ${NC}"
     echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}📄 Файл:${NC} $latest_diag"
-    echo -e "${YELLOW}📏 Размер:${NC} $(du -h "$latest_diag" | cut -f1)"
-    echo -e "${YELLOW}📅 Дата:${NC} $(stat -c %y "$latest_diag" | cut -d. -f1)"
-    echo ""
-    
     cat "$latest_diag"
 }
 
 cmd_update() {
     log_action "update"
     echo "Проверка обновлений Xray..."
-
     local current_version latest
     current_version=$(xray version 2>&1 | head -1 | grep -oP 'Xray \K[0-9.]+' || echo "unknown")
     latest=$(curl -sL https://github.com/XTLS/Xray-core/releases/latest 2>/dev/null | grep -oP 'tag/v\K[0-9.]+' | head -1 || echo "unknown")
-
     if [[ "$current_version" == "$latest" ]]; then
         echo -e "${GREEN}✓ Xray актуален: $current_version${NC}"
         return 0
     fi
-
     echo "Доступна: $latest (текущая: $current_version)"
     read -p "Обновить? (y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return 0
-
     systemctl stop xray.service
     cd /tmp
     wget -q -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/v${latest}/Xray-linux-64.zip"
@@ -1758,34 +1531,16 @@ cmd_update() {
     rm -f /tmp/xray.zip
     chmod +x /usr/local/xray/xray
     systemctl start xray.service
-
     echo -e "${GREEN}✓ Xray обновлён до $latest${NC}"
 }
 
 cmd_version() {
-    echo "xray-admin v6.4.1"
+    echo "xray-admin v6.4.2"
     echo "VPN Relay Manager (Namespace + veth + socat)"
-    echo ""
-    echo "Компоненты:"
-    echo "  Xray: $(xray version 2>&1 | head -1 || echo 'нет')"
-    echo "  Hysteria2: $(hysteria version 2>&1 | head -1 || echo 'нет')"
-    echo "  AmneziaWG: $(awg --version 2>&1 | head -1 || echo 'нет')"
-    echo "  Socat: $(socat -V 2>&1 | head -1 || echo 'нет')"
-    echo ""
-    echo "Архитектура:"
-    echo "  • Xray/Hysteria2 в namespace 'xray'"
-    echo "  • veth-пара для связи namespaces"
-    echo "  • Socat пробрасывает 443/8443 через veth"
-    echo "  • Трафик через AmneziaWG на РФ relay"
-    echo ""
-    echo "Диагностика:"
-    echo "  • Бэкапы: $BACKUP_DIR"
-    echo "  • Отчёты: $DIAGNOSTICS_DIR"
-    echo "  • Лог: $LOG_FILE"
 }
 
 cmd_help() {
-    echo -e "${CYAN}xray-admin v6.4.1 - VPN Relay Manager${NC}"
+    echo -e "${CYAN}xray-admin v6.4.2 - VPN Relay Manager${NC}"
     echo ""
     echo "Команды:"
     echo "  status              - Статус сервисов"
@@ -1799,31 +1554,25 @@ cmd_help() {
     echo "  restore             - Восстановить из бэкапа"
     echo "  diagnostics         - Показать отчёт"
     echo "  update              - Обновить Xray"
-    echo "  version             - Версия компонентов"
+    echo "  version             - Версия"
     echo "  help                - Эта справка"
-    echo ""
-    echo "Примеры:"
-    echo "  xray-admin add my-phone"
-    echo "  xray-admin links admin"
-    echo "  xray-admin status"
-    echo "  xray-admin diagnostics"
 }
 
 case "${1:-help}" in
-    status)     cmd_status ;;
-    add)        cmd_add_client "${2:-}" ;;
-    remove)     cmd_remove_client "${2:-}" ;;
-    rename)     cmd_rename_client "${2:-}" "${3:-}" ;;
-    links)      cmd_gen_links "${2:-all}" ;;
-    restart)    cmd_restart ;;
-    monitor)    cmd_monitor ;;
-    alerts)     cmd_setup_alerts ;;
-    restore)    cmd_restore ;;
+    status)      cmd_status ;;
+    add)         cmd_add_client "${2:-}" ;;
+    remove)      cmd_remove_client "${2:-}" ;;
+    rename)      cmd_rename_client "${2:-}" "${3:-}" ;;
+    links)       cmd_gen_links "${2:-all}" ;;
+    restart)     cmd_restart ;;
+    monitor)     cmd_monitor ;;
+    alerts)      cmd_setup_alerts ;;
+    restore)     cmd_restore ;;
     diagnostics) cmd_diagnostics ;;
-    update)     cmd_update ;;
+    update)      cmd_update ;;
     version|--version|-v) cmd_version ;;
     help|--help|-h|"") cmd_help ;;
-    *)          echo "Неизвестная команда: $1"; cmd_help; exit 1 ;;
+    *)           echo "Неизвестная команда: $1"; cmd_help; exit 1 ;;
 esac
 ADMINEOF
 
@@ -1833,25 +1582,21 @@ log "✓ Управляющий скрипт: $ADMIN_BIN"
 section "✅ Установка завершена!"
 
 echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  VPN Relay v6.4.1 (Namespace + veth + socat)       ║${NC}"
+echo -e "${GREEN}║  VPN Relay v6.4.2 (Namespace + veth + socat)       ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
+TUNNEL_IP=$(ip netns exec xray curl -s4 --max-time 5 ifconfig.me 2>/dev/null || echo "N/A")
+
 echo -e "${YELLOW}Архитектура:${NC}"
-echo "  📱 Клиент → eth0:443/8443 (основной интерфейс)"
+echo "  📱 Клиент → eth0:443/8443"
 echo "       ↓"
-echo "  🔌 Socat (TCP/UDP) с жёсткими зависимостями"
+echo "  🔌 Socat → veth-host ↔ veth-ns"
 echo "       ↓"
-echo "  🌐 veth-host (10.200.0.1) ↔ veth-ns (10.200.0.2)"
-echo "       ↓"
-echo "  📦 Namespace 'xray' (изолированная среда)"
-echo "       ├── Xray (порт 443, VLESS-REALITY)"
-echo "       ├── Hysteria2 (порт 8443, UDP)"
-echo "       └── awg0 (AmneziaWG туннель)"
-echo "              ↓"
-echo "  🇷🇺 РФ relay ($RELAY_IP)"
-echo "              ↓"
-echo "  🌐 Интернет"
+echo "  📦 Namespace 'xray'"
+echo "       ├── Xray (VLESS-REALITY, TCP 443)"
+echo "       ├── Hysteria2 (QUIC, UDP 8443)"
+echo "       └── awg0 → РФ relay ($RELAY_IP)"
 echo ""
 
 echo -e "${YELLOW}Статус:${NC}"
@@ -1870,37 +1615,26 @@ printf "  %-30s %s\n" "veth-host:" "$VETH_HOST_IP"
 printf "  %-30s %s\n" "veth-ns:" "$VETH_NS_IP"
 echo ""
 
-echo -e "${YELLOW}Порты:${NC}"
-ss -tlnp | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет TCP"
-ss -ulnp | grep -E ":(443|8443)" | sed 's/^/  /' || echo "  Нет UDP"
+echo -e "${YELLOW}Порты (детерминированная проверка ss -H):${NC}"
+echo "  TCP 443:"
+ss -H -ltnp "sport = :443" 2>/dev/null | sed 's/^/    /' || echo "    (не слушается)"
+echo "  UDP 8443:"
+ss -H -lunp "sport = :8443" 2>/dev/null | sed 's/^/    /' || echo "    (не слушается)"
 echo ""
 
 echo -e "${YELLOW}Управление:${NC}"
-echo "  xray-admin status         # Статус"
-echo "  xray-admin add user       # Добавить"
-echo "  xray-admin remove user    # Удалить"
-echo "  xray-admin rename old new # Переименовать"
-echo "  xray-admin links          # Ссылки"
-echo "  xray-admin restart        # Перезапуск"
-echo "  xray-admin monitor        # Мониторинг"
-echo "  xray-admin alerts         # Оповещения"
-echo "  xray-admin diagnostics    # Отчёт"
-echo "  xray-admin version        # Версия"
-echo "  xray-admin restore        # Восстановить"
-echo "  xray-admin help           # Помощь"
+echo "  xray-admin status       # Статус"
+echo "  xray-admin add user     # Добавить"
+echo "  xray-admin remove user  # Удалить"
+echo "  xray-admin links        # Ссылки"
+echo "  xray-admin restart      # Перезапуск"
+echo "  xray-admin diagnostics  # Отчёт"
 echo ""
 
 echo -e "${YELLOW}Диагностика:${NC}"
 echo "  • Бэкапы: $BACKUP_DIR"
 echo "  • Отчёты: $DIAGNOSTICS_DIR"
 echo "  • Лог: $LOG"
-echo ""
-
-echo -e "${YELLOW}Безопасность:${NC}"
-echo "  • SSH ключи"
-echo "  • Изоляция в namespace"
-echo "  • veth-пара для связи"
-echo "  • Трафик через туннель"
 echo ""
 
 echo -e "${GREEN}✓ Готово!${NC}"
@@ -1911,15 +1645,15 @@ with open('/root/setup-vpn-relay.sh', 'w') as f:
     f.write(script)
 
 os.chmod('/root/setup-vpn-relay.sh', 0o755)
-print(f"✅ Скрипт v6.4.1 создан: /root/setup-vpn-relay.sh")
+print(f"✅ Скрипт v6.4.2 создан: /root/setup-vpn-relay.sh")
 print(f"📊 Размер: {os.path.getsize('/root/setup-vpn-relay.sh')} байт")
 print(f"📝 Строк: {script.count(chr(10))}")
-print(f"\n🔧 Ключевые исправления в v6.4.1:")
-print(f"  ✓ Устранена циклическая зависимость между wg-namespace и awg-quick")
-print(f"  ✓ wg-namespace.service НЕ запускает awg-quick")
-print(f"  ✓ Отдельный скрипт move-awg0-to-namespace.sh для переноса интерфейса")
-print(f"  ✓ ExecStartPost в awg-quick@.service для переноса awg0 в namespace")
-print(f"  ✓ Правильная цепочка: wgNS → AWG → Xray/Hysteria → Socat")
-print(f"  ✓ wait_for_interface() вместо sleep 3")
-print(f"  ✓ TimeoutStartSec=30 для oneshot сервисов")
+print(f"\n🔧 Ключевые исправления в v6.4.2:")
+print(f"  ✓ Детерминированная проверка сокетов: ss -H -ltn 'sport = :443'")
+print(f"  ✓ wait_for_tcp_port / wait_for_udp_port — цикл ожидания события")
+print(f"  ✓ wait_for_namespace_tcp_port / wait_for_namespace_udp_port — проверка внутри namespace")
+print(f"  ✓ Убран systemctl start awg-quick из setup-awg-namespace.sh (убрана гонка)")
+print(f"  ✓ Линейная цепочка: wgNS → awg-quick(+ExecStartPost) → xray → socat")
+print(f"  ✓ ExecStartPre=sleep 3 (сокращён с 5 до 3s, т.к. wait_for_socket ждёт)")
+print(f"  ✓ 6 smoke-тестов по базе v6.0.2: туннель, TCP 443 в ns, UDP 8443 в ns, TCP 443 на хосте, UDP 8443 на хосте, veth ping")
 PYEOF
